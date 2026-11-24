@@ -84,14 +84,16 @@ async function listLink(link, origin) {
 
   if (subType === 'folder' && subId) {
     const sub = all.find((x) => x.node.directory && x.node.nodeId === subId);
-    if (!sub) throw new Error('Sub-folder not found in this link');
-    title = sub.node.name || title;
-    basePath = sub.parts;
-    scope = all.filter(
-      (x) => x.parts.length > basePath.length && basePath.every((s, i) => x.parts[i] === s)
-    );
+    if (sub) {
+      title = sub.node.name || title;
+      basePath = sub.parts;
+      scope = all.filter(
+        (x) => x.parts.length > basePath.length && basePath.every((s, i) => x.parts[i] === s)
+      );
+    }
   } else if (subType === 'file' && subId) {
-    scope = all.filter((x) => !x.node.directory && x.node.nodeId === subId);
+    const single = all.filter((x) => !x.node.directory && x.node.nodeId === subId);
+    if (single.length) scope = single;
   }
 
   const videos = scope
