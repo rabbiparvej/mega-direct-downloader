@@ -1,8 +1,12 @@
 {
-  "name": "mega-direct-downloader",
-  "version": "1.0.0",
+  "name": "mega-direct-download",
+  "version": "2.0.0",
   "private": true,
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "megajs": "^1.3.7"
+    "express": "^4.19.2",
+    "megajs": "^1.3.0"
   }
 }
