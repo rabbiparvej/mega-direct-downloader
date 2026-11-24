@@ -90,14 +90,12 @@ function createFolderFileUrl(folderUrl, fileId) {
 
   const url = new URL(folderUrl);
 
-  // Original shared-folder encryption key.
   const folderKey = url.hash.slice(1).split("/")[0];
 
   if (!folderKey) {
     throw new Error("MEGA folder key missing");
   }
 
-  // MEGAJS selected-file link format.
   url.hash = `${folderKey}/file/${fileId}`;
 
   return url.toString();
@@ -115,9 +113,6 @@ async function loadExactFolderFile(folderUrl, fileId) {
 
   const mainFile = File.fromURL(directUrl);
 
-  // IMPORTANT:
-  // For a folder URL containing /file/FILE_ID,
-  // loadAttributes() returns the selected file.
   const selectedFile = await mainFile.loadAttributes();
 
   if (
@@ -143,35 +138,61 @@ async function loadExactFolderFile(folderUrl, fileId) {
 
 function collectVideos(folder) {
   const videos = [];
+  const skipped = [];
 
   function walk(directory, parentPath = "") {
-    for (const item of directory.children || []) {
+    const children = Array.isArray(directory.children)
+      ? directory.children
+      : [];
+
+    for (const item of children) {
       const path = parentPath
-        ? `${parentPath}/${item.name}`
-        : item.name;
+        ? `${parentPath}/${item.name || "Unnamed"}`
+        : (item.name || "Unnamed");
 
-      if (item.children) {
+      if (item.directory || Array.isArray(item.children)) {
         walk(item, path);
-      } else if (
-        VIDEO_EXTENSIONS.has(getExtension(item.name))
-      ) {
-        if (!item.nodeId) {
-          throw new Error(
-            `Missing MEGA file ID: ${item.name}`
-          );
-        }
-
-        videos.push({
-          file: item,
-          path
-        });
+        continue;
       }
+
+      if (!VIDEO_EXTENSIONS.has(getExtension(item.name))) {
+        continue;
+      }
+
+      const fileId = item.nodeId
+        ? String(item.nodeId)
+        : "";
+
+      if (!fileId) {
+        console.warn(
+          "Skipping video without MEGA nodeId:",
+          item.name,
+          Object.keys(item)
+        );
+
+        skipped.push({
+          name: item.name || "Unknown",
+          path,
+          reason: "Missing MEGA nodeId"
+        });
+
+        continue;
+      }
+
+      videos.push({
+        file: item,
+        fileId,
+        path
+      });
     }
   }
 
   walk(folder);
 
-  return videos;
+  return {
+    videos,
+    skipped
+  };
 }
 
 // =====================================
@@ -195,7 +216,7 @@ function sortVideos(videos) {
 // PREMIUM DASHBOARD
 // =====================================
 
-function renderFolderPage(videos, folderUrl) {
+function renderFolderPage(videos, folderUrl, skippedCount = 0) {
   const totalSize = videos.reduce(
     (sum, item) =>
       sum + (Number(item.file.size) || 0),
@@ -203,7 +224,7 @@ function renderFolderPage(videos, folderUrl) {
   );
 
   const cards = videos.map((item, index) => {
-    const fileId = String(item.file.nodeId);
+    const fileId = item.fileId;
 
     const name = escapeHtml(item.file.name);
     const path = escapeHtml(item.path);
@@ -322,6 +343,15 @@ header {
   border-radius: 20px;
   font-size: 12px;
   margin-top: 14px;
+}
+
+.warning {
+  background: #422b12;
+  color: #fbbf24;
+  padding: 12px;
+  border-radius: 10px;
+  margin-bottom: 20px;
+  font-size: 13px;
 }
 
 .stats {
@@ -493,6 +523,13 @@ footer {
 
 </header>
 
+${skippedCount > 0 ? `
+  <div class="warning">
+    ⚠ ${skippedCount} video(s) could not be identified and were skipped.
+    Check the JSON API for details.
+  </div>
+` : ""}
+
 <div class="stats">
 
   <div class="stat">
@@ -513,7 +550,7 @@ footer {
 
 ${cards || `
   <div class="empty">
-    No supported video files found in this folder.
+    No downloadable video files found in this folder.
   </div>
 `}
 
@@ -656,7 +693,8 @@ const server = http.createServer(async (req, res) => {
       rangeSupport: true,
       folderScanner: true,
       premiumDashboard: true,
-      directFileSelection: true
+      directFileSelection: true,
+      skipMissingFileId: true
     }));
 
   }
@@ -691,15 +729,14 @@ const server = http.createServer(async (req, res) => {
 
       await folder.loadAttributes();
 
-      const videos = sortVideos(
-        collectVideos(folder)
-      );
+      const scanResult = collectVideos(folder);
 
-      // Create an individual URL for each video.
+      const videos = sortVideos(scanResult.videos);
+      const skipped = scanResult.skipped;
 
       const result = videos.map((item, index) => {
 
-        const fileId = String(item.file.nodeId);
+        const fileId = item.fileId;
 
         const downloadUrl =
           `${BASE_URL}/download?folder=${encodeURIComponent(folderUrl)}` +
@@ -732,6 +769,8 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({
           success: true,
           totalVideos: result.length,
+          skippedCount: skipped.length,
+          skippedFiles: skipped,
           videos: result
         }));
 
@@ -744,7 +783,11 @@ const server = http.createServer(async (req, res) => {
       });
 
       return res.end(
-        renderFolderPage(videos, folderUrl)
+        renderFolderPage(
+          videos,
+          folderUrl,
+          skipped.length
+        )
       );
 
     } catch (error) {
@@ -900,8 +943,6 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "HEAD") {
       return res.end();
     }
-
-    // Download only the exact selected MEGA file.
 
     download = file.download({
       start,
