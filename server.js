@@ -136,6 +136,7 @@ async function loadExactFolderFile(folderUrl, fileId) {
 // COLLECT VIDEO FILES
 // =====================================
 
+
 function collectVideos(folder) {
   const videos = [];
   const skipped = [];
@@ -164,24 +165,14 @@ function collectVideos(folder) {
         : "";
 
       if (!fileId) {
-  console.log("MEGA FILE DEBUG:", {
-    name: item.name,
-    keys: Object.keys(item),
-    nodeId: item.nodeId,
-    id: item.id,
-    downloadId: item.downloadId,
-    attributes: item.attributes,
-    directory: item.directory
-  });
-
-  skipped.push({
-    name: item.name || "Unknown",
-    path,
-    reason: "Missing MEGA nodeId"
-  });
-
-  continue;
-}
+        console.log("MEGA FILE DEBUG:", {
+          name: item.name,
+          keys: Object.keys(item),
+          nodeId: item.nodeId,
+          id: item.id,
+          downloadId: item.downloadId,
+          attributes: item.attributes
+        });
 
         skipped.push({
           name: item.name || "Unknown",
@@ -202,11 +193,9 @@ function collectVideos(folder) {
 
   walk(folder);
 
-  return {
-    videos,
-    skipped
-  };
+  return { videos, skipped };
 }
+
 
 // =====================================
 // SORT VIDEOS A-Z
