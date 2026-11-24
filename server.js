@@ -612,7 +612,16 @@ const server = http.createServer(async (req, res) => {
 
       await folder.loadAttributes();
 
-      const videos = collectVideos(folder);
+      const videos = collectVideos(folder).sort((a, b) =>
+  String(a.file.name || "").localeCompare(
+    String(b.file.name || ""),
+    undefined,
+    {
+      numeric: true,
+      sensitivity: "base"
+    }
+  )
+);
 
       const result = videos.map((item, index) => {
 
