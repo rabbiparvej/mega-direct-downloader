@@ -11,9 +11,9 @@ const VIDEO_EXTENSIONS = new Set([
   ".wmv", ".flv", ".ogv"
 ]);
 
-// ===============================
+// =====================================
 // MEGA URL VALIDATION
-// ===============================
+// =====================================
 
 function validMegaUrl(value, type) {
   try {
@@ -25,16 +25,16 @@ function validMegaUrl(value, type) {
       u.pathname.startsWith(
         type === "folder" ? "/folder/" : "/file/"
       ) &&
-      Boolean(u.hash)
+      Boolean(u.hash.slice(1))
     );
   } catch {
     return false;
   }
 }
 
-// ===============================
+// =====================================
 // HELPER FUNCTIONS
-// ===============================
+// =====================================
 
 function getExtension(name) {
   const match = String(name || "")
@@ -55,57 +55,91 @@ function escapeHtml(value) {
 }
 
 function formatBytes(bytes) {
-  if (!Number.isFinite(Number(bytes)) || Number(bytes) <= 0) {
+  bytes = Number(bytes);
+
+  if (!Number.isFinite(bytes) || bytes <= 0) {
     return "Unknown size";
   }
 
   const units = ["B", "KB", "MB", "GB", "TB"];
 
   const index = Math.min(
-    Math.floor(Math.log(Number(bytes)) / Math.log(1024)),
+    Math.floor(Math.log(bytes) / Math.log(1024)),
     units.length - 1
   );
 
   return (
-    Number(bytes) / Math.pow(1024, index)
+    bytes / Math.pow(1024, index)
   ).toFixed(2) + " " + units[index];
 }
 
-// ===============================
-// CREATE DIRECT FOLDER FILE URL
-// ===============================
+// =====================================
+// CREATE EXACT MEGA FILE URL
+// =====================================
 
 function createFolderFileUrl(folderUrl, fileId) {
   if (!validMegaUrl(folderUrl, "folder")) {
     throw new Error("Invalid MEGA folder URL");
   }
 
-  if (!/^[A-Za-z0-9_-]+$/.test(String(fileId))) {
+  fileId = String(fileId || "");
+
+  if (!/^[A-Za-z0-9_-]+$/.test(fileId)) {
     throw new Error("Invalid MEGA file ID");
   }
 
   const url = new URL(folderUrl);
 
-  // Keep the original folder key.
-  const folderKey = url.hash
-    .slice(1)
-    .split("/")[0];
+  // Original shared-folder encryption key.
+  const folderKey = url.hash.slice(1).split("/")[0];
 
   if (!folderKey) {
-    throw new Error("MEGA folder key is missing");
+    throw new Error("MEGA folder key missing");
   }
 
-  // MEGAJS format:
-  // /folder/FOLDER_ID#FOLDER_KEY/file/FILE_ID
-
+  // MEGAJS selected-file link format.
   url.hash = `${folderKey}/file/${fileId}`;
 
   return url.toString();
 }
 
-// ===============================
-// FOLDER VIDEO SCANNER
-// ===============================
+// =====================================
+// LOAD EXACT FILE FROM SHARED FOLDER
+// =====================================
+
+async function loadExactFolderFile(folderUrl, fileId) {
+  const directUrl = createFolderFileUrl(
+    folderUrl,
+    fileId
+  );
+
+  const mainFile = File.fromURL(directUrl);
+
+  // IMPORTANT:
+  // For a folder URL containing /file/FILE_ID,
+  // loadAttributes() returns the selected file.
+  const selectedFile = await mainFile.loadAttributes();
+
+  if (
+    !selectedFile ||
+    selectedFile.directory ||
+    selectedFile.children
+  ) {
+    throw new Error("Selected MEGA item is not a file");
+  }
+
+  if (
+    String(selectedFile.nodeId) !== String(fileId)
+  ) {
+    throw new Error("MEGA file ID verification failed");
+  }
+
+  return selectedFile;
+}
+
+// =====================================
+// COLLECT VIDEO FILES
+// =====================================
 
 function collectVideos(folder) {
   const videos = [];
@@ -140,9 +174,26 @@ function collectVideos(folder) {
   return videos;
 }
 
-// ===============================
-// PREMIUM HTML DASHBOARD
-// ===============================
+// =====================================
+// SORT VIDEOS A-Z
+// =====================================
+
+function sortVideos(videos) {
+  return videos.sort((a, b) =>
+    String(a.file.name || "").localeCompare(
+      String(b.file.name || ""),
+      undefined,
+      {
+        numeric: true,
+        sensitivity: "base"
+      }
+    )
+  );
+}
+
+// =====================================
+// PREMIUM DASHBOARD
+// =====================================
 
 function renderFolderPage(videos, folderUrl) {
   const totalSize = videos.reduce(
@@ -152,6 +203,8 @@ function renderFolderPage(videos, folderUrl) {
   );
 
   const cards = videos.map((item, index) => {
+    const fileId = String(item.file.nodeId);
+
     const name = escapeHtml(item.file.name);
     const path = escapeHtml(item.path);
     const size = formatBytes(item.file.size);
@@ -164,7 +217,7 @@ function renderFolderPage(videos, folderUrl) {
 
     const downloadUrl =
       `${BASE_URL}/download?folder=${encodeURIComponent(folderUrl)}` +
-      `&fileId=${encodeURIComponent(item.file.nodeId)}`;
+      `&fileId=${encodeURIComponent(fileId)}`;
 
     return `
       <article class="video-card">
@@ -511,55 +564,33 @@ document.querySelectorAll(".copy-btn").forEach(button => {
 </html>`;
 }
 
-// ===============================
-// GET DOWNLOAD FILE
-// ===============================
+// =====================================
+// LOAD DOWNLOAD FILE
+// =====================================
 
 async function getDownloadFile(requestUrl) {
   const folderUrl = requestUrl.searchParams.get("folder");
   const fileId = requestUrl.searchParams.get("fileId");
 
   if (folderUrl && fileId) {
-    // Build the exact MEGA shared-folder file URL.
-    const directFileUrl = createFolderFileUrl(
+    return await loadExactFolderFile(
       folderUrl,
       fileId
     );
-
-    const selectedFile = File.fromURL(directFileUrl);
-
-    // IMPORTANT:
-    // For a folder link ending in /file/FILE_ID,
-    // loadAttributes() returns the selected file.
-    const file = await selectedFile.loadAttributes();
-
-    if (
-      !file ||
-      file.directory ||
-      file.children
-    ) {
-      throw new Error("Selected MEGA item is not a file");
-    }
-
-    if (!Number.isSafeInteger(Number(file.size)) || Number(file.size) <= 0) {
-      throw new Error("Invalid or unavailable file size");
-    }
-
-    return file;
   }
 
-  // Standalone MEGA file link support.
   const megaUrl = requestUrl.searchParams.get("url");
 
   if (!megaUrl || !validMegaUrl(megaUrl, "file")) {
     throw new Error("Invalid MEGA file link");
   }
 
-  const file = File.fromURL(megaUrl);
+  const fileObject = File.fromURL(megaUrl);
 
-  await file.loadAttributes();
+  const file = await fileObject.loadAttributes();
 
   if (
+    !file ||
     file.directory ||
     file.children
   ) {
@@ -569,9 +600,9 @@ async function getDownloadFile(requestUrl) {
   return file;
 }
 
-// ===============================
+// =====================================
 // HTTP SERVER
-// ===============================
+// =====================================
 
 const server = http.createServer(async (req, res) => {
 
@@ -609,9 +640,9 @@ const server = http.createServer(async (req, res) => {
     return res.end("Invalid request URL");
   }
 
-  // =============================
+  // =================================
   // SERVER STATUS
-  // =============================
+  // =================================
 
   if (requestUrl.pathname === "/") {
 
@@ -630,9 +661,9 @@ const server = http.createServer(async (req, res) => {
 
   }
 
-  // =============================
-  // MEGA FOLDER SCANNER
-  // =============================
+  // =================================
+  // FOLDER SCANNER
+  // =================================
 
   if (
     requestUrl.pathname === "/folder" &&
@@ -644,6 +675,7 @@ const server = http.createServer(async (req, res) => {
       const folderUrl = requestUrl.searchParams.get("url");
 
       if (!folderUrl || !validMegaUrl(folderUrl, "folder")) {
+
         res.writeHead(400, {
           "Content-Type": "application/json"
         });
@@ -652,29 +684,26 @@ const server = http.createServer(async (req, res) => {
           success: false,
           error: "Invalid MEGA folder link"
         }));
+
       }
 
       const folder = File.fromURL(folderUrl);
 
       await folder.loadAttributes();
 
-      const videos = collectVideos(folder).sort((a, b) =>
-        String(a.file.name || "").localeCompare(
-          String(b.file.name || ""),
-          undefined,
-          {
-            numeric: true,
-            sensitivity: "base"
-          }
-        )
+      const videos = sortVideos(
+        collectVideos(folder)
       );
 
-      // Each video receives its own unique file ID URL.
+      // Create an individual URL for each video.
+
       const result = videos.map((item, index) => {
+
+        const fileId = String(item.file.nodeId);
 
         const downloadUrl =
           `${BASE_URL}/download?folder=${encodeURIComponent(folderUrl)}` +
-          `&fileId=${encodeURIComponent(item.file.nodeId)}`;
+          `&fileId=${encodeURIComponent(fileId)}`;
 
         return {
           serial: index + 1,
@@ -684,7 +713,7 @@ const server = http.createServer(async (req, res) => {
           sizeMB: (
             Number(item.file.size) / 1048576
           ).toFixed(2),
-          fileId: item.file.nodeId,
+          fileId,
           downloadUrl
         };
 
@@ -722,7 +751,7 @@ const server = http.createServer(async (req, res) => {
 
       console.error(
         "Folder scanner error:",
-        error.message
+        error
       );
 
       res.writeHead(500, {
@@ -739,16 +768,18 @@ const server = http.createServer(async (req, res) => {
 
   }
 
-  // =============================
-  // DOWNLOAD + RANGE SUPPORT
-  // =============================
+  // =================================
+  // DOWNLOAD + RANGE / RESUME
+  // =================================
 
   if (
     requestUrl.pathname !== "/download" ||
     !["GET", "HEAD"].includes(req.method)
   ) {
+
     res.writeHead(404);
     return res.end("Not found");
+
   }
 
   let download;
@@ -799,12 +830,14 @@ const server = http.createServer(async (req, res) => {
           !Number.isSafeInteger(suffix) ||
           suffix <= 0
         ) {
+
           res.writeHead(416, {
             "Content-Range": `bytes */${size}`,
             "Accept-Ranges": "bytes"
           });
 
           return res.end();
+
         }
 
         start = Math.max(0, size - suffix);
@@ -856,8 +889,10 @@ const server = http.createServer(async (req, res) => {
     };
 
     if (statusCode === 206) {
+
       headers["Content-Range"] =
         `bytes ${start}-${end}/${size}`;
+
     }
 
     res.writeHead(statusCode, headers);
@@ -865,6 +900,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "HEAD") {
       return res.end();
     }
+
+    // Download only the exact selected MEGA file.
 
     download = file.download({
       start,
@@ -874,7 +911,7 @@ const server = http.createServer(async (req, res) => {
     download.on("error", error => {
 
       console.error(
-        "Download error:",
+        "Download stream error:",
         error.message
       );
 
@@ -909,8 +946,8 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
 
     console.error(
-      "Server error:",
-      error.message
+      "Download error:",
+      error
     );
 
     if (!res.headersSent) {
@@ -936,9 +973,9 @@ const server = http.createServer(async (req, res) => {
 
 });
 
-// ===============================
+// =====================================
 // START SERVER
-// ===============================
+// =====================================
 
 server.listen(PORT, "0.0.0.0", () => {
 
