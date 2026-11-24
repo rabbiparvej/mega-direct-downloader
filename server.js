@@ -1,1029 +1,244 @@
-
-const http = require("http");
-const { File } = require("megajs");
+// Mega Folder → Direct Download (Render ready)
+// Env: MEGA_FOLDER_URL = https://mega.nz/folder/XXXXXXXX#YYYYYYYY
+const express = require('express');
+const { File } = require('megajs');
 
 const PORT = process.env.PORT || 3000;
-const BASE_URL = "https://megadl-api-mion.onrender.com";
+const MEGA_FOLDER_URL = process.env.MEGA_FOLDER_URL || '';
+const CACHE_MS = 10 * 60 * 1000;
+const VIDEO_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|ts|3gp|mpg|mpeg)$/i;
 
-const VIDEO_EXTENSIONS = new Set([
-  ".mp4", ".mkv", ".avi", ".mov", ".webm",
-  ".m4v", ".3gp", ".ts", ".mpg", ".mpeg",
-  ".wmv", ".flv", ".ogv"
-]);
+const app = express();
+app.disable('x-powered-by');
 
-// =====================================
-// MEGA URL VALIDATION
-// =====================================
+/* ---------- Mega folder loader ---------- */
+let state = { at: 0, title: '', items: [], map: new Map() };
+let loading = null;
 
-function validMegaUrl(value, type) {
+function walk(node, prefix, out, map) {
+  for (const child of node.children || []) {
+    if (child.directory) {
+      walk(child, prefix + child.name + ' / ', out, map);
+    } else if (VIDEO_EXT.test(child.name || '')) {
+      const id = child.nodeId;
+      map.set(id, child);
+      out.push({ id, name: child.name, folder: prefix, size: child.size || 0 });
+    }
+  }
+}
+
+async function loadFolder(force = false) {
+  if (!MEGA_FOLDER_URL) throw new Error('MEGA_FOLDER_URL সেট করা হয়নি');
+  if (!force && state.items.length && Date.now() - state.at < CACHE_MS) return state;
+  if (loading) return loading;
+  loading = (async () => {
+    const root = File.fromURL(MEGA_FOLDER_URL);
+    await root.loadAttributes();
+    const items = [], map = new Map();
+    walk(root, '', items, map);
+    // নাম অনুযায়ী সিরিয়াল (1, 2, 10 — সঠিক সংখ্যা ক্রমে)
+    items.sort((a, b) =>
+      (a.folder + a.name).localeCompare(b.folder + b.name, undefined, { numeric: true, sensitivity: 'base' })
+    );
+    items.forEach((it, i) => { it.no = i + 1; it.url = `/dl/${encodeURIComponent(it.id)}/${encodeURIComponent(it.name)}`; });
+    state = { at: Date.now(), title: root.name || 'Videos', items, map };
+    return state;
+  })();
+  try { return await loading; } finally { loading = null; }
+}
+
+/* ---------- API ---------- */
+app.get('/api/files', async (req, res) => {
   try {
-    const u = new URL(value);
-    const hosts = ["mega.nz", "www.mega.nz", "mega.co.nz"];
-
-    return (
-      hosts.includes(u.hostname) &&
-      u.pathname.startsWith(
-        type === "folder" ? "/folder/" : "/file/"
-      ) &&
-      Boolean(u.hash.slice(1))
-    );
-  } catch {
-    return false;
+    const s = await loadFolder(req.query.refresh === '1');
+    res.json({ title: s.title, count: s.items.length, items: s.items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-}
-
-// =====================================
-// HELPER FUNCTIONS
-// =====================================
-
-function getExtension(name) {
-  const match = String(name || "")
-    .toLowerCase()
-    .match(/\.[^.]+$/);
-
-  return match ? match[0] : "";
-}
-
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, char => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
-  })[char]);
-}
-
-function formatBytes(bytes) {
-  bytes = Number(bytes);
-
-  if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "Unknown size";
-  }
-
-  const units = ["B", "KB", "MB", "GB", "TB"];
-
-  const index = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    units.length - 1
-  );
-
-  return (
-    bytes / Math.pow(1024, index)
-  ).toFixed(2) + " " + units[index];
-}
-
-// =====================================
-// CREATE EXACT MEGA FILE URL
-// =====================================
-
-function createFolderFileUrl(folderUrl, fileId) {
-  if (!validMegaUrl(folderUrl, "folder")) {
-    throw new Error("Invalid MEGA folder URL");
-  }
-
-  fileId = String(fileId || "");
-
-  if (!/^[A-Za-z0-9_-]+$/.test(fileId)) {
-    throw new Error("Invalid MEGA file ID");
-  }
-
-  const url = new URL(folderUrl);
-
-  const folderKey = url.hash.slice(1).split("/")[0];
-
-  if (!folderKey) {
-    throw new Error("MEGA folder key missing");
-  }
-
-  url.hash = `${folderKey}/file/${fileId}`;
-
-  return url.toString();
-}
-
-// =====================================
-// LOAD EXACT FILE FROM SHARED FOLDER
-// =====================================
-
-async function loadExactFolderFile(folderUrl, fileId) {
-  const directUrl = createFolderFileUrl(
-    folderUrl,
-    fileId
-  );
-
-  const mainFile = File.fromURL(directUrl);
-
-  const selectedFile = await mainFile.loadAttributes();
-
-  if (
-    !selectedFile ||
-    selectedFile.directory ||
-    selectedFile.children
-  ) {
-    throw new Error("Selected MEGA item is not a file");
-  }
-
-  if (
-    String(selectedFile.nodeId) !== String(fileId)
-  ) {
-    throw new Error("MEGA file ID verification failed");
-  }
-
-  return selectedFile;
-}
-
-// =====================================
-// COLLECT VIDEO FILES
-// =====================================
-
-
-function collectVideos(folder) {
-  const videos = [];
-  const skipped = [];
-
-  function walk(directory, parentPath = "") {
-    const children = Array.isArray(directory.children)
-      ? directory.children
-      : [];
-
-    for (const item of children) {
-      const path = parentPath
-        ? `${parentPath}/${item.name || "Unnamed"}`
-        : (item.name || "Unnamed");
-
-      if (item.directory || Array.isArray(item.children)) {
-        walk(item, path);
-        continue;
-      }
-
-      if (!VIDEO_EXTENSIONS.has(getExtension(item.name))) {
-        continue;
-      }
-
-      const fileId = item.nodeId
-        ? String(item.nodeId)
-        : "";
-
-      if (!fileId) {
-        console.log("MEGA FILE DEBUG:", {
-          name: item.name,
-          keys: Object.keys(item),
-          nodeId: item.nodeId,
-          id: item.id,
-          downloadId: item.downloadId,
-          attributes: item.attributes
-        });
-
-        skipped.push({
-          name: item.name || "Unknown",
-          path,
-          reason: "Missing MEGA nodeId"
-        });
-
-        continue;
-      }
-
-      videos.push({
-        file: item,
-        fileId,
-        path
-      });
-    }
-  }
-
-  walk(folder);
-
-  return { videos, skipped };
-}
-
-
-// =====================================
-// SORT VIDEOS A-Z
-// =====================================
-
-function sortVideos(videos) {
-  return videos.sort((a, b) =>
-    String(a.file.name || "").localeCompare(
-      String(b.file.name || ""),
-      undefined,
-      {
-        numeric: true,
-        sensitivity: "base"
-      }
-    )
-  );
-}
-
-// =====================================
-// PREMIUM DASHBOARD
-// =====================================
-
-function renderFolderPage(videos, folderUrl, skippedCount = 0) {
-  const totalSize = videos.reduce(
-    (sum, item) =>
-      sum + (Number(item.file.size) || 0),
-    0
-  );
-
-  const cards = videos.map((item, index) => {
-    const fileId = item.fileId;
-
-    const name = escapeHtml(item.file.name);
-    const path = escapeHtml(item.path);
-    const size = formatBytes(item.file.size);
-
-    const extension = escapeHtml(
-      getExtension(item.file.name)
-        .replace(".", "")
-        .toUpperCase()
-    );
-
-    const downloadUrl =
-      `${BASE_URL}/download?folder=${encodeURIComponent(folderUrl)}` +
-      `&fileId=${encodeURIComponent(fileId)}`;
-
-    return `
-      <article class="video-card">
-
-        <div class="card-top">
-          <span class="serial">
-            #${String(index + 1).padStart(2, "0")}
-          </span>
-
-          <span class="format">
-            ${extension || "VIDEO"}
-          </span>
-        </div>
-
-        <h3>${name}</h3>
-
-        <p class="path">${path}</p>
-
-        <div class="info">
-          <span>📦 ${size}</span>
-          <span>🎬 ${extension || "Video"} File</span>
-        </div>
-
-        <div class="actions">
-
-          <button
-            class="copy-btn"
-            data-url="${escapeHtml(downloadUrl)}"
-          >
-            📋 Copy Link
-          </button>
-
-          <a
-            class="download-btn"
-            href="${escapeHtml(downloadUrl)}"
-          >
-            ⬇ Download
-          </a>
-
-        </div>
-
-      </article>
-    `;
-  }).join("");
-
-  return `<!DOCTYPE html>
-<html lang="en">
-
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
-<title>MEGADL - Premium Video Downloader</title>
-
-<style>
-
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  background: #090d18;
-  color: #f5f7ff;
-  font-family: Arial, sans-serif;
-  padding: 20px;
-}
-
-.container {
-  max-width: 950px;
-  margin: auto;
-}
-
-header {
-  padding: 24px 0;
-  border-bottom: 1px solid #252d40;
-  margin-bottom: 24px;
-}
-
-.logo {
-  font-size: 30px;
-  font-weight: 900;
-  letter-spacing: 1px;
-}
-
-.logo span {
-  color: #38bdf8;
-}
-
-.subtitle {
-  color: #94a3b8;
-  font-size: 12px;
-  margin-top: 7px;
-  letter-spacing: 2px;
-}
-
-.status {
-  display: inline-block;
-  background: #123c32;
-  color: #4ade80;
-  padding: 7px 12px;
-  border-radius: 20px;
-  font-size: 12px;
-  margin-top: 14px;
-}
-
-.warning {
-  background: #422b12;
-  color: #fbbf24;
-  padding: 12px;
-  border-radius: 10px;
-  margin-bottom: 20px;
-  font-size: 13px;
-}
-
-.stats {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 12px;
-  margin-bottom: 25px;
-}
-
-.stat {
-  background: #141c2d;
-  border: 1px solid #26334b;
-  border-radius: 15px;
-  padding: 18px;
-}
-
-.stat small {
-  color: #94a3b8;
-}
-
-.stat h2 {
-  font-size: 25px;
-  margin: 9px 0 0;
-  overflow-wrap: anywhere;
-}
-
-.section-title {
-  font-size: 19px;
-  margin: 25px 0 15px;
-}
-
-.video-card {
-  background: linear-gradient(145deg, #182238, #111827);
-  border: 1px solid #293750;
-  border-radius: 17px;
-  padding: 18px;
-  margin-bottom: 14px;
-}
-
-.card-top {
-  display: flex;
-  justify-content: space-between;
-}
-
-.serial {
-  color: #38bdf8;
-  font-weight: bold;
-}
-
-.format {
-  background: #26364d;
-  color: #93c5fd;
-  padding: 5px 9px;
-  border-radius: 7px;
-  font-size: 11px;
-}
-
-.video-card h3 {
-  font-size: 16px;
-  overflow-wrap: anywhere;
-  margin: 17px 0 7px;
-}
-
-.path {
-  font-size: 12px;
-  color: #94a3b8;
-  overflow-wrap: anywhere;
-}
-
-.info {
-  display: flex;
-  gap: 15px;
-  flex-wrap: wrap;
-  color: #aab8ce;
-  font-size: 12px;
-  margin: 17px 0;
-}
-
-.actions {
-  display: flex;
-  gap: 10px;
-}
-
-.actions button,
-.actions a {
-  flex: 1;
-  text-align: center;
-  padding: 13px 8px;
-  border: 0;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: bold;
-  text-decoration: none;
-  cursor: pointer;
-}
-
-.copy-btn {
-  background: #26364d;
-  color: #e2e8f0;
-}
-
-.copy-btn:hover {
-  background: #334b6a;
-}
-
-.download-btn {
-  background: #0284c7;
-  color: white;
-}
-
-.download-btn:hover {
-  background: #0369a1;
-}
-
-.empty {
-  text-align: center;
-  padding: 35px;
-  background: #141c2d;
-  border-radius: 15px;
-  color: #94a3b8;
-}
-
-footer {
-  text-align: center;
-  color: #64748b;
-  font-size: 12px;
-  padding: 30px 0;
-}
-
-@media(max-width: 450px) {
-  body {
-    padding: 14px;
-  }
-
-  .logo {
-    font-size: 26px;
-  }
-
-  .actions {
-    gap: 7px;
-  }
-
-  .actions button,
-  .actions a {
-    font-size: 12px;
-  }
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="container">
-
-<header>
-
-  <div class="logo">
-    MEGA<span>DL</span>
-  </div>
-
-  <div class="subtitle">
-    PREMIUM VIDEO DOWNLOAD CENTER
-  </div>
-
-  <div class="status">
-    ✓ Folder Scan Complete
-  </div>
-
-</header>
-
-${skippedCount > 0 ? `
-  <div class="warning">
-    ⚠ ${skippedCount} video(s) could not be identified and were skipped.
-    Check the JSON API for details.
-  </div>
-` : ""}
-
-<div class="stats">
-
-  <div class="stat">
-    <small>TOTAL VIDEOS</small>
-    <h2>${videos.length}</h2>
-  </div>
-
-  <div class="stat">
-    <small>TOTAL SIZE</small>
-    <h2>${formatBytes(totalSize)}</h2>
-  </div>
-
-</div>
-
-<h2 class="section-title">
-  Available Videos
-</h2>
-
-${cards || `
-  <div class="empty">
-    No downloadable video files found in this folder.
-  </div>
-`}
-
-<footer>
-  MEGADL · Premium Direct Download Service
-</footer>
-
-</div>
-
-<script>
-
-document.querySelectorAll(".copy-btn").forEach(button => {
-
-  button.addEventListener("click", async () => {
-
-    const url = button.dataset.url;
-
-    try {
-      await navigator.clipboard.writeText(url);
-      button.textContent = "✓ Copied!";
-    } catch {
-      const input = document.createElement("textarea");
-
-      input.value = url;
-      document.body.appendChild(input);
-      input.select();
-
-      const copied = document.execCommand("copy");
-
-      input.remove();
-
-      button.textContent = copied
-        ? "✓ Copied!"
-        : "Copy Failed";
-    }
-
-    setTimeout(() => {
-      button.textContent = "📋 Copy Link";
-    }, 1800);
-
-  });
-
 });
 
-</script>
-
-</body>
-</html>`;
-}
-
-// =====================================
-// LOAD DOWNLOAD FILE
-// =====================================
-
-async function getDownloadFile(requestUrl) {
-  const folderUrl = requestUrl.searchParams.get("folder");
-  const fileId = requestUrl.searchParams.get("fileId");
-
-  if (folderUrl && fileId) {
-    return await loadExactFolderFile(
-      folderUrl,
-      fileId
-    );
-  }
-
-  const megaUrl = requestUrl.searchParams.get("url");
-
-  if (!megaUrl || !validMegaUrl(megaUrl, "file")) {
-    throw new Error("Invalid MEGA file link");
-  }
-
-  const fileObject = File.fromURL(megaUrl);
-
-  const file = await fileObject.loadAttributes();
-
-  if (
-    !file ||
-    file.directory ||
-    file.children
-  ) {
-    throw new Error("Cannot download a folder");
-  }
-
-  return file;
-}
-
-// =====================================
-// HTTP SERVER
-// =====================================
-
-const server = http.createServer(async (req, res) => {
-
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET, HEAD, OPTIONS"
-  );
-
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Range"
-  );
-
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    "Accept-Ranges, Content-Range, Content-Length, Content-Disposition"
-  );
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
-  }
-
-  let requestUrl;
-
+/* ---------- Direct download (stream, resume supported) ---------- */
+app.get('/dl/:id/:name?', async (req, res) => {
   try {
-    requestUrl = new URL(
-      req.url,
-      `http://${req.headers.host}`
-    );
-  } catch {
-    res.writeHead(400);
-    return res.end("Invalid request URL");
-  }
-
-  // =================================
-  // SERVER STATUS
-  // =================================
-
-  if (requestUrl.pathname === "/") {
-
-    res.writeHead(200, {
-      "Content-Type": "application/json"
-    });
-
-    return res.end(JSON.stringify({
-      success: true,
-      message: "MEGADL Download Server is running",
-      rangeSupport: true,
-      folderScanner: true,
-      premiumDashboard: true,
-      directFileSelection: true,
-      skipMissingFileId: true
-    }));
-
-  }
-
-  // =================================
-  // FOLDER SCANNER
-  // =================================
-
-  if (
-    requestUrl.pathname === "/folder" &&
-    req.method === "GET"
-  ) {
-
-    try {
-
-      const folderUrl = requestUrl.searchParams.get("url");
-
-      if (!folderUrl || !validMegaUrl(folderUrl, "folder")) {
-
-        res.writeHead(400, {
-          "Content-Type": "application/json"
-        });
-
-        return res.end(JSON.stringify({
-          success: false,
-          error: "Invalid MEGA folder link"
-        }));
-
-      }
-
-      const folder = File.fromURL(folderUrl);
-
-      await folder.loadAttributes();
-
-      const scanResult = collectVideos(folder);
-
-      const videos = sortVideos(scanResult.videos);
-      const skipped = scanResult.skipped;
-
-      const result = videos.map((item, index) => {
-
-        const fileId = item.fileId;
-
-        const downloadUrl =
-          `${BASE_URL}/download?folder=${encodeURIComponent(folderUrl)}` +
-          `&fileId=${encodeURIComponent(fileId)}`;
-
-        return {
-          serial: index + 1,
-          name: item.file.name,
-          path: item.path,
-          size: item.file.size,
-          sizeMB: (
-            Number(item.file.size) / 1048576
-          ).toFixed(2),
-          fileId,
-          downloadUrl
-        };
-
-      });
-
-      // JSON API MODE
-
-      if (
-        requestUrl.searchParams.get("format") === "json"
-      ) {
-
-        res.writeHead(200, {
-          "Content-Type": "application/json; charset=utf-8"
-        });
-
-        return res.end(JSON.stringify({
-          success: true,
-          totalVideos: result.length,
-          skippedCount: skipped.length,
-          skippedFiles: skipped,
-          videos: result
-        }));
-
-      }
-
-      // PREMIUM HTML MODE
-
-      res.writeHead(200, {
-        "Content-Type": "text/html; charset=utf-8"
-      });
-
-      return res.end(
-        renderFolderPage(
-          videos,
-          folderUrl,
-          skipped.length
-        )
-      );
-
-    } catch (error) {
-
-      console.error(
-        "Folder scanner error:",
-        error
-      );
-
-      res.writeHead(500, {
-        "Content-Type": "application/json"
-      });
-
-      return res.end(JSON.stringify({
-        success: false,
-        error: "Unable to scan MEGA folder",
-        details: error.message
-      }));
-
-    }
-
-  }
-
-  // =================================
-  // DOWNLOAD + RANGE / RESUME
-  // =================================
-
-  if (
-    requestUrl.pathname !== "/download" ||
-    !["GET", "HEAD"].includes(req.method)
-  ) {
-
-    res.writeHead(404);
-    return res.end("Not found");
-
-  }
-
-  let download;
-
-  try {
-
-    const file = await getDownloadFile(requestUrl);
-
-    const size = Number(file.size);
-
-    if (
-      !Number.isSafeInteger(size) ||
-      size <= 0
-    ) {
-      throw new Error("Invalid file size");
-    }
-
-    const filename = encodeURIComponent(
-      file.name || "download"
-    );
-
-    let start = 0;
-    let end = size - 1;
-    let statusCode = 200;
-
-    const range = req.headers.range;
-
-    if (range) {
-
-      const match = /^bytes=(\d*)-(\d*)$/.exec(range);
-
-      if (!match || (!match[1] && !match[2])) {
-
-        res.writeHead(416, {
-          "Content-Range": `bytes */${size}`,
-          "Accept-Ranges": "bytes"
-        });
-
-        return res.end();
-
-      }
-
-      if (!match[1]) {
-
-        const suffix = Number(match[2]);
-
-        if (
-          !Number.isSafeInteger(suffix) ||
-          suffix <= 0
-        ) {
-
-          res.writeHead(416, {
-            "Content-Range": `bytes */${size}`,
-            "Accept-Ranges": "bytes"
-          });
-
-          return res.end();
-
-        }
-
-        start = Math.max(0, size - suffix);
-
-      } else {
-
-        start = Number(match[1]);
-
-        end = match[2]
-          ? Number(match[2])
-          : size - 1;
-
-      }
-
-      if (
-        !Number.isSafeInteger(start) ||
-        !Number.isSafeInteger(end) ||
-        start < 0 ||
-        start >= size ||
-        end < start
-      ) {
-
-        res.writeHead(416, {
-          "Content-Range": `bytes */${size}`,
-          "Accept-Ranges": "bytes"
-        });
-
-        return res.end();
-
-      }
-
-      end = Math.min(end, size - 1);
-
-      statusCode = 206;
-
-    }
-
+    let s = await loadFolder();
+    let file = s.map.get(req.params.id);
+    if (!file) { s = await loadFolder(true); file = s.map.get(req.params.id); }
+    if (!file) return res.status(404).send('ফাইল পাওয়া যায়নি');
+
+    const size = file.size;
+    const safe = file.name.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '');
     const headers = {
-
-      "Content-Type": "application/octet-stream",
-
-      "Content-Disposition":
-        `attachment; filename*=UTF-8''${filename}`,
-
-      "Accept-Ranges": "bytes",
-
-      "Content-Length": end - start + 1
-
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${safe}"; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
     };
 
-    if (statusCode === 206) {
-
-      headers["Content-Range"] =
-        `bytes ${start}-${end}/${size}`;
-
-    }
-
-    res.writeHead(statusCode, headers);
-
-    if (req.method === "HEAD") {
-      return res.end();
-    }
-
-    download = file.download({
-      start,
-      end
-    });
-
-    download.on("error", error => {
-
-      console.error(
-        "Download stream error:",
-        error.message
-      );
-
-      if (!res.destroyed) {
-        res.destroy(error);
+    let start = 0, end = size - 1, status = 200;
+    const m = /bytes=(\d*)-(\d*)/.exec(req.headers.range || '');
+    if (m && (m[1] || m[2])) {
+      if (m[1]) { start = parseInt(m[1], 10); if (m[2]) end = Math.min(parseInt(m[2], 10), size - 1); }
+      else { start = Math.max(size - parseInt(m[2], 10), 0); }
+      if (start > end || start >= size) {
+        res.writeHead(416, { 'Content-Range': `bytes */${size}` });
+        return res.end();
       }
-
-    });
-
-    req.on("aborted", () => {
-
-      if (download && !download.destroyed) {
-        download.destroy();
-      }
-
-    });
-
-    res.on("close", () => {
-
-      if (
-        !res.writableEnded &&
-        download &&
-        !download.destroyed
-      ) {
-        download.destroy();
-      }
-
-    });
-
-    download.pipe(res);
-
-  } catch (error) {
-
-    console.error(
-      "Download error:",
-      error
-    );
-
-    if (!res.headersSent) {
-
-      res.writeHead(500, {
-        "Content-Type": "application/json"
-      });
-
-      res.end(JSON.stringify({
-        success: false,
-        error:
-          error.message ||
-          "Unable to download this MEGA file"
-      }));
-
-    } else if (!res.destroyed) {
-
-      res.destroy(error);
-
+      status = 206;
+      headers['Content-Range'] = `bytes ${start}-${end}/${size}`;
     }
+    headers['Content-Length'] = end - start + 1;
+    res.writeHead(status, headers);
 
+    const stream = file.download({ start, end: end + 1 });
+    req.on('close', () => stream.destroy());
+    stream.on('error', () => res.destroy());
+    stream.pipe(res);
+  } catch (e) {
+    if (!res.headersSent) res.status(500).send('ডাউনলোড ব্যর্থ: ' + e.message);
+    else res.destroy();
   }
-
 });
 
-// =====================================
-// START SERVER
-// =====================================
+app.get('/health', (_, res) => res.send('ok'));
 
-server.listen(PORT, "0.0.0.0", () => {
+/* ---------- Premium UI ---------- */
+const PAGE = `<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Video Library</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Manrope:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0d1020; --bg2:#141934; --line:#262d52; --ink:#eceef8; --mute:#8a92b4;
+  --gold:#e6c883; --gold2:#b8975a; --ok:#7fd6a8;
+  --sans:'Manrope','Hind Siliguri',system-ui,sans-serif;
+  --serif:'Fraunces','Hind Siliguri',Georgia,serif;
+}
+*{box-sizing:border-box;margin:0}
+html{background:var(--bg)}
+body{font-family:var(--sans);color:var(--ink);min-height:100vh;
+  background:radial-gradient(900px 500px at 85% -10%,#2a2150 0,transparent 60%),
+             radial-gradient(700px 400px at -10% 10%,#16264f 0,transparent 55%),var(--bg);
+  padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:960px;margin:0 auto;padding:56px 22px 90px}
+header h1{font-family:var(--serif);font-weight:600;font-size:clamp(30px,6vw,52px);letter-spacing:-.02em;line-height:1.1;
+  background:linear-gradient(120deg,#fff 20%,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent;word-break:break-word}
+.stats{margin-top:14px;color:var(--mute);font-size:15px;display:flex;gap:18px;flex-wrap:wrap}
+.stats b{color:var(--gold);font-weight:700}
+.bar{display:flex;gap:10px;margin:34px 0 8px;flex-wrap:wrap}
+.search{flex:1;min-width:200px;position:relative}
+.search input{width:100%;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--ink);
+  padding:14px 16px;border-radius:14px;font:inherit;font-size:15px;outline:none;transition:border-color .2s,background .2s}
+.search input:focus{border-color:var(--gold2);background:rgba(255,255,255,.07)}
+.btn{font:inherit;font-size:14px;font-weight:600;cursor:pointer;border-radius:12px;padding:12px 18px;border:1px solid var(--line);
+  background:rgba(255,255,255,.04);color:var(--ink);text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  transition:transform .15s,border-color .2s,background .2s;white-space:nowrap}
+.btn:hover{border-color:var(--gold2);background:rgba(230,200,131,.08)}
+.btn:active{transform:scale(.97)}
+.btn:focus-visible,input:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.btn.gold{background:linear-gradient(135deg,var(--gold),var(--gold2));color:#1a1405;border-color:transparent}
+.btn.gold:hover{filter:brightness(1.08);background:linear-gradient(135deg,var(--gold),var(--gold2))}
+.btn.done{border-color:var(--ok);color:var(--ok)}
+ol{list-style:none;padding:0}
+li{display:grid;grid-template-columns:64px 1fr auto;gap:18px;align-items:center;padding:20px 4px;border-bottom:1px solid var(--line)}
+.no{font-family:var(--serif);font-size:34px;font-weight:500;color:var(--gold);opacity:.85;text-align:right;font-variant-numeric:tabular-nums}
+.info{min-width:0}
+.name{font-size:17px;font-weight:600;line-height:1.4;word-break:break-word}
+.meta{margin-top:5px;color:var(--mute);font-size:13px;display:flex;gap:12px;flex-wrap:wrap}
+.meta .path{opacity:.85}
+.act{display:flex;gap:8px}
+.state{padding:70px 0;text-align:center;color:var(--mute)}
+.spin{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--gold);border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+.toast{position:fixed;left:50%;bottom:calc(26px + env(safe-area-inset-bottom));transform:translate(-50%,20px);opacity:0;pointer-events:none;
+  background:#1d2347;border:1px solid var(--gold2);color:var(--ink);padding:12px 20px;border-radius:999px;font-size:14px;
+  transition:opacity .25s,transform .25s;z-index:9}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:640px){
+  .wrap{padding-top:40px}
+  li{grid-template-columns:44px 1fr;gap:12px}
+  .no{font-size:26px}
+  .act{grid-column:1/-1}
+  .act .btn{flex:1}
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1 id="title">Video Library</h1>
+    <div class="stats" id="stats"></div>
+  </header>
+  <div class="bar">
+    <div class="search"><input id="q" type="search" placeholder="ভিডিও খুঁজুন…" autocomplete="off"></div>
+    <button class="btn" id="copyAll">সব লিংক কপি</button>
+    <button class="btn" id="refresh">রিফ্রেশ</button>
+  </div>
+  <ol id="list"></ol>
+  <div class="state" id="state"><div class="spin"></div>ভিডিও লোড হচ্ছে…</div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+let ALL=[];
+const fmt=b=>{if(!b)return'—';const u=['B','KB','MB','GB','TB'];let i=0;while(b>=1024&&i<4){b/=1024;i++}return b.toFixed(i?1:0)+' '+u[i]};
+const full=u=>location.origin+u;
+function toast(t){const el=$('#toast');el.textContent=t;el.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>el.classList.remove('show'),1800)}
+async function copy(text){
+  try{await navigator.clipboard.writeText(text)}
+  catch{const a=document.createElement('textarea');a.value=text;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
+}
+function render(){
+  const q=$('#q').value.trim().toLowerCase();
+  const list=$('#list');list.textContent='';
+  const rows=ALL.filter(v=>(v.folder+v.name).toLowerCase().includes(q));
+  for(const v of rows){
+    const li=document.createElement('li');
+    const no=document.createElement('div');no.className='no';no.textContent=v.no;
+    const info=document.createElement('div');info.className='info';
+    const n=document.createElement('div');n.className='name';n.textContent=v.name;
+    const m=document.createElement('div');m.className='meta';
+    const sz=document.createElement('span');sz.textContent=fmt(v.size);m.append(sz);
+    if(v.folder){const p=document.createElement('span');p.className='path';p.textContent=v.folder.replace(/ \\/ $/,'');m.append(p)}
+    info.append(n,m);
+    const act=document.createElement('div');act.className='act';
+    const c=document.createElement('button');c.className='btn';c.textContent='লিংক কপি';
+    c.onclick=async()=>{await copy(full(v.url));c.textContent='কপি হয়েছে';c.classList.add('done');toast('Direct link কপি হয়েছে');
+      setTimeout(()=>{c.textContent='লিংক কপি';c.classList.remove('done')},1600)};
+    const d=document.createElement('a');d.className='btn gold';d.href=v.url;d.textContent='ডাউনলোড';d.setAttribute('download',v.name);
+    act.append(c,d);
+    li.append(no,info,act);list.append(li);
+  }
+  const st=$('#state');
+  if(!rows.length){st.style.display='block';st.textContent=ALL.length?'কোনো ভিডিও মেলেনি':'এই ফোল্ডারে কোনো ভিডিও নেই'}else st.style.display='none';
+}
+async function load(refresh){
+  $('#state').style.display='block';$('#state').innerHTML='<div class="spin"></div>ভিডিও লোড হচ্ছে…';$('#list').textContent='';
+  try{
+    const r=await fetch('/api/files'+(refresh?'?refresh=1':''));
+    const j=await r.json();if(!r.ok)throw new Error(j.error);
+    ALL=j.items;$('#title').textContent=j.title;document.title=j.title;
+    const total=ALL.reduce((a,b)=>a+b.size,0);
+    $('#stats').innerHTML='<span><b>'+j.count+'</b> টি ভিডিও</span><span>মোট <b>'+fmt(total)+'</b></span>';
+    render();
+  }catch(e){$('#state').textContent='লোড ব্যর্থ: '+e.message}
+}
+$('#q').addEventListener('input',render);
+$('#refresh').onclick=()=>load(true);
+$('#copyAll').onclick=async()=>{if(!ALL.length)return;await copy(ALL.map(v=>full(v.url)).join('\\n'));toast(ALL.length+' টি লিংক কপি হয়েছে')};
+load();
+</script>
+</body>
+</html>`;
 
-  console.log(
-    `MEGADL Premium Server running on port ${PORT}`
-  );
+app.get('/', (_, res) => res.type('html').send(PAGE));
 
+app.listen(PORT, () => {
+  console.log('Server running on port ' + PORT);
+  loadFolder().then(s => console.log('Loaded ' + s.items.length + ' videos')).catch(e => console.error(e.message));
 });
