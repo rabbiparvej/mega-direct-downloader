@@ -20,10 +20,13 @@ function validMegaUrl(value, type) {
     const u = new URL(value);
     const hosts = ["mega.nz", "www.mega.nz", "mega.co.nz"];
 
-    return hosts.includes(u.hostname) &&
+    return (
+      hosts.includes(u.hostname) &&
       u.pathname.startsWith(
         type === "folder" ? "/folder/" : "/file/"
-      );
+      ) &&
+      Boolean(u.hash)
+    );
   } catch {
     return false;
   }
@@ -34,7 +37,10 @@ function validMegaUrl(value, type) {
 // ===============================
 
 function getExtension(name) {
-  const match = String(name || "").toLowerCase().match(/\.[^.]+$/);
+  const match = String(name || "")
+    .toLowerCase()
+    .match(/\.[^.]+$/);
+
   return match ? match[0] : "";
 }
 
@@ -66,6 +72,38 @@ function formatBytes(bytes) {
 }
 
 // ===============================
+// CREATE DIRECT FOLDER FILE URL
+// ===============================
+
+function createFolderFileUrl(folderUrl, fileId) {
+  if (!validMegaUrl(folderUrl, "folder")) {
+    throw new Error("Invalid MEGA folder URL");
+  }
+
+  if (!/^[A-Za-z0-9_-]+$/.test(String(fileId))) {
+    throw new Error("Invalid MEGA file ID");
+  }
+
+  const url = new URL(folderUrl);
+
+  // Keep the original folder key.
+  const folderKey = url.hash
+    .slice(1)
+    .split("/")[0];
+
+  if (!folderKey) {
+    throw new Error("MEGA folder key is missing");
+  }
+
+  // MEGAJS format:
+  // /folder/FOLDER_ID#FOLDER_KEY/file/FILE_ID
+
+  url.hash = `${folderKey}/file/${fileId}`;
+
+  return url.toString();
+}
+
+// ===============================
 // FOLDER VIDEO SCANNER
 // ===============================
 
@@ -80,7 +118,15 @@ function collectVideos(folder) {
 
       if (item.children) {
         walk(item, path);
-      } else if (VIDEO_EXTENSIONS.has(getExtension(item.name))) {
+      } else if (
+        VIDEO_EXTENSIONS.has(getExtension(item.name))
+      ) {
+        if (!item.nodeId) {
+          throw new Error(
+            `Missing MEGA file ID: ${item.name}`
+          );
+        }
+
         videos.push({
           file: item,
           path
@@ -94,32 +140,14 @@ function collectVideos(folder) {
   return videos;
 }
 
-function findFileById(folder, id) {
-  function walk(directory) {
-    for (const item of directory.children || []) {
-      if (String(item.nodeId) === String(id)) {
-        return item;
-      }
-
-      if (item.children) {
-        const found = walk(item);
-        if (found) return found;
-      }
-    }
-
-    return null;
-  }
-
-  return walk(folder);
-}
-
 // ===============================
 // PREMIUM HTML DASHBOARD
 // ===============================
 
 function renderFolderPage(videos, folderUrl) {
   const totalSize = videos.reduce(
-    (sum, item) => sum + (Number(item.file.size) || 0),
+    (sum, item) =>
+      sum + (Number(item.file.size) || 0),
     0
   );
 
@@ -264,6 +292,7 @@ header {
 .stat h2 {
   font-size: 25px;
   margin: 9px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .section-title {
@@ -370,7 +399,6 @@ footer {
 }
 
 @media(max-width: 450px) {
-
   body {
     padding: 14px;
   }
@@ -387,7 +415,6 @@ footer {
   .actions a {
     font-size: 12px;
   }
-
 }
 
 </style>
@@ -452,12 +479,9 @@ document.querySelectorAll(".copy-btn").forEach(button => {
     const url = button.dataset.url;
 
     try {
-
       await navigator.clipboard.writeText(url);
       button.textContent = "✓ Copied!";
-
     } catch {
-
       const input = document.createElement("textarea");
 
       input.value = url;
@@ -471,7 +495,6 @@ document.querySelectorAll(".copy-btn").forEach(button => {
       button.textContent = copied
         ? "✓ Copied!"
         : "Copy Failed";
-
     }
 
     setTimeout(() => {
@@ -493,29 +516,39 @@ document.querySelectorAll(".copy-btn").forEach(button => {
 // ===============================
 
 async function getDownloadFile(requestUrl) {
-
   const folderUrl = requestUrl.searchParams.get("folder");
   const fileId = requestUrl.searchParams.get("fileId");
 
   if (folderUrl && fileId) {
+    // Build the exact MEGA shared-folder file URL.
+    const directFileUrl = createFolderFileUrl(
+      folderUrl,
+      fileId
+    );
 
-    if (!validMegaUrl(folderUrl, "folder")) {
-      throw new Error("Invalid MEGA folder link");
+    const selectedFile = File.fromURL(directFileUrl);
+
+    // IMPORTANT:
+    // For a folder link ending in /file/FILE_ID,
+    // loadAttributes() returns the selected file.
+    const file = await selectedFile.loadAttributes();
+
+    if (
+      !file ||
+      file.directory ||
+      file.children
+    ) {
+      throw new Error("Selected MEGA item is not a file");
     }
 
-    const folder = File.fromURL(folderUrl);
-
-    await folder.loadAttributes();
-
-    const file = findFileById(folder, fileId);
-
-    if (!file || file.children) {
-      throw new Error("File not found in folder");
+    if (!Number.isSafeInteger(Number(file.size)) || Number(file.size) <= 0) {
+      throw new Error("Invalid or unavailable file size");
     }
 
     return file;
   }
 
+  // Standalone MEGA file link support.
   const megaUrl = requestUrl.searchParams.get("url");
 
   if (!megaUrl || !validMegaUrl(megaUrl, "file")) {
@@ -525,6 +558,13 @@ async function getDownloadFile(requestUrl) {
   const file = File.fromURL(megaUrl);
 
   await file.loadAttributes();
+
+  if (
+    file.directory ||
+    file.children
+  ) {
+    throw new Error("Cannot download a folder");
+  }
 
   return file;
 }
@@ -557,10 +597,17 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  const requestUrl = new URL(
-    req.url,
-    `http://${req.headers.host}`
-  );
+  let requestUrl;
+
+  try {
+    requestUrl = new URL(
+      req.url,
+      `http://${req.headers.host}`
+    );
+  } catch {
+    res.writeHead(400);
+    return res.end("Invalid request URL");
+  }
 
   // =============================
   // SERVER STATUS
@@ -577,7 +624,8 @@ const server = http.createServer(async (req, res) => {
       message: "MEGADL Download Server is running",
       rangeSupport: true,
       folderScanner: true,
-      premiumDashboard: true
+      premiumDashboard: true,
+      directFileSelection: true
     }));
 
   }
@@ -596,7 +644,6 @@ const server = http.createServer(async (req, res) => {
       const folderUrl = requestUrl.searchParams.get("url");
 
       if (!folderUrl || !validMegaUrl(folderUrl, "folder")) {
-
         res.writeHead(400, {
           "Content-Type": "application/json"
         });
@@ -605,7 +652,6 @@ const server = http.createServer(async (req, res) => {
           success: false,
           error: "Invalid MEGA folder link"
         }));
-
       }
 
       const folder = File.fromURL(folderUrl);
@@ -613,16 +659,17 @@ const server = http.createServer(async (req, res) => {
       await folder.loadAttributes();
 
       const videos = collectVideos(folder).sort((a, b) =>
-  String(a.file.name || "").localeCompare(
-    String(b.file.name || ""),
-    undefined,
-    {
-      numeric: true,
-      sensitivity: "base"
-    }
-  )
-);
+        String(a.file.name || "").localeCompare(
+          String(b.file.name || ""),
+          undefined,
+          {
+            numeric: true,
+            sensitivity: "base"
+          }
+        )
+      );
 
+      // Each video receives its own unique file ID URL.
       const result = videos.map((item, index) => {
 
         const downloadUrl =
@@ -635,8 +682,9 @@ const server = http.createServer(async (req, res) => {
           path: item.path,
           size: item.file.size,
           sizeMB: (
-            item.file.size / 1048576
+            Number(item.file.size) / 1048576
           ).toFixed(2),
+          fileId: item.file.nodeId,
           downloadUrl
         };
 
@@ -699,11 +747,8 @@ const server = http.createServer(async (req, res) => {
     requestUrl.pathname !== "/download" ||
     !["GET", "HEAD"].includes(req.method)
   ) {
-
     res.writeHead(404);
-
     return res.end("Not found");
-
   }
 
   let download;
@@ -712,15 +757,14 @@ const server = http.createServer(async (req, res) => {
 
     const file = await getDownloadFile(requestUrl);
 
-    if (file.directory) {
+    const size = Number(file.size);
 
-      res.writeHead(400);
-
-      return res.end("Cannot download a folder");
-
+    if (
+      !Number.isSafeInteger(size) ||
+      size <= 0
+    ) {
+      throw new Error("Invalid file size");
     }
-
-    const size = file.size;
 
     const filename = encodeURIComponent(
       file.name || "download"
@@ -755,13 +799,12 @@ const server = http.createServer(async (req, res) => {
           !Number.isSafeInteger(suffix) ||
           suffix <= 0
         ) {
-
           res.writeHead(416, {
-            "Content-Range": `bytes */${size}`
+            "Content-Range": `bytes */${size}`,
+            "Accept-Ranges": "bytes"
           });
 
           return res.end();
-
         }
 
         start = Math.max(0, size - suffix);
@@ -813,10 +856,8 @@ const server = http.createServer(async (req, res) => {
     };
 
     if (statusCode === 206) {
-
       headers["Content-Range"] =
         `bytes ${start}-${end}/${size}`;
-
     }
 
     res.writeHead(statusCode, headers);
@@ -858,9 +899,7 @@ const server = http.createServer(async (req, res) => {
         download &&
         !download.destroyed
       ) {
-
         download.destroy();
-
       }
 
     });
