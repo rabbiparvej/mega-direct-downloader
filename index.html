@@ -363,6 +363,22 @@ async function generate(){
     button.textContent="↗ Generate Download";
   }
 }
+</script> 
+  <button id="megaDownloadBtn" type="button">
+  Download from MEGA
+</button>
+
+<script>
+document.getElementById("megaDownloadBtn").addEventListener("click", () => {
+  const url = document.getElementById("megaUrl")?.value?.trim();
+
+  if (!url) {
+    alert("আগে MEGA link দিন।");
+    return;
+  }
+
+  window.open(url, "_blank");
+});
 </script>
 </body>
 </html>
