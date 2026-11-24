@@ -15,20 +15,17 @@ const pending = new Map();
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
-function walk(node, fn, path = '') {
+function indexNodes(node, parts = [], out = []) {
   for (const child of node.children || []) {
-    if (child.directory) walk(child, fn, path ? path + ' / ' + child.name : child.name);
-    else fn(child, path);
+    const p = parts.concat(child.name || '');
+    out.push({ node: child, parts: p });
+    if (child.directory) indexNodes(child, p, out);
   }
+  return out;
 }
 
-function findNode(node, id) {
-  if (node.nodeId === id) return node;
-  for (const child of node.children || []) {
-    const hit = findNode(child, id);
-    if (hit) return hit;
-  }
-  return null;
+function toId(parts) {
+  return Buffer.from(parts.join('/'), 'utf8').toString('base64url');
 }
 
 async function getFolder(folderId, key) {
@@ -78,39 +75,46 @@ async function listLink(link, origin) {
   if (!m) throw new Error('Invalid MEGA folder link');
   const [, folderId, key, subType, subId] = m;
 
-  let root = await getFolder(folderId, key);
+  const root = await getFolder(folderId, key);
+  const all = indexNodes(root);
+
   let title = root.name || 'MEGA Folder';
+  let scope = all;
+  let basePath = [];
 
   if (subType === 'folder' && subId) {
-    const sub = findNode(root, subId);
+    const sub = all.find((x) => x.node.directory && x.node.nodeId === subId);
     if (!sub) throw new Error('Sub-folder not found in this link');
-    root = sub;
-    title = sub.name || title;
+    title = sub.node.name || title;
+    basePath = sub.parts;
+    scope = all.filter(
+      (x) => x.parts.length > basePath.length && basePath.every((s, i) => x.parts[i] === s)
+    );
+  } else if (subType === 'file' && subId) {
+    scope = all.filter((x) => !x.node.directory && x.node.nodeId === subId);
   }
 
-  const videos = [];
-  if (subType === 'file' && subId) {
-    const single = findNode(root, subId);
-    if (single && !single.directory) videos.push({ node: single, path: '' });
-  } else {
-    walk(root, (node, path) => {
-      if (VIDEO_EXT.test(node.name || '')) videos.push({ node, path });
-    });
-  }
+  const videos = scope
+    .filter((x) => !x.node.directory && VIDEO_EXT.test(x.node.name || ''))
+    .map((x) => ({
+      node: x.node,
+      parts: x.parts,
+      path: x.parts.slice(basePath.length, -1).join(' / ')
+    }));
 
   videos.sort((a, b) => collator.compare(a.path, b.path) || collator.compare(a.node.name, b.node.name));
 
   const items = videos.map((v, i) => {
     const name = v.node.name;
-    const link = origin + '/dl/' + folderId + '/' + v.node.nodeId + '/' + encodeURIComponent(name) + '?k=' + key;
+    const dl = origin + '/dl/' + folderId + '/' + toId(v.parts) + '/' + encodeURIComponent(name) + '?k=' + key;
     return {
       index: i + 1,
       name,
       path: v.path,
       size: v.node.size,
       sizeText: formatSize(v.node.size),
-      download: link,
-      stream: link + '&inline=1'
+      download: dl,
+      stream: dl + '&inline=1'
     };
   });
 
@@ -147,16 +151,25 @@ app.get('/api/list', async (req, res) => {
   }
 });
 
-app.get('/dl/:folderId/:nodeId/:name?', async (req, res) => {
-  const { folderId, nodeId } = req.params;
+app.get('/dl/:folderId/:pid/:name?', async (req, res) => {
+  const { folderId, pid } = req.params;
   const key = req.query.k;
   if (!key) return res.status(400).send('Missing key');
 
   try {
     const root = await getFolder(folderId, key);
-    const node = findNode(root, nodeId);
-    if (!node || node.directory) return res.status(404).send('File not found');
 
+    let wanted;
+    try {
+      wanted = Buffer.from(pid, 'base64url').toString('utf8');
+    } catch (e) {
+      return res.status(400).send('Bad file id');
+    }
+
+    const hit = indexNodes(root).find((x) => !x.node.directory && x.parts.join('/') === wanted);
+    if (!hit) return res.status(404).send('File not found');
+
+    const node = hit.node;
     const size = node.size;
     const name = node.name;
     const inline = req.query.inline === '1';
