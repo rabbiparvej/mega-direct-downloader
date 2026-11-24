@@ -164,11 +164,24 @@ function collectVideos(folder) {
         : "";
 
       if (!fileId) {
-        console.warn(
-          "Skipping video without MEGA nodeId:",
-          item.name,
-          Object.keys(item)
-        );
+  console.log("MEGA FILE DEBUG:", {
+    name: item.name,
+    keys: Object.keys(item),
+    nodeId: item.nodeId,
+    id: item.id,
+    downloadId: item.downloadId,
+    attributes: item.attributes,
+    directory: item.directory
+  });
+
+  skipped.push({
+    name: item.name || "Unknown",
+    path,
+    reason: "Missing MEGA nodeId"
+  });
+
+  continue;
+}
 
         skipped.push({
           name: item.name || "Unknown",
