@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#090b13">
+<title>MEGA Downloader — Premium</title>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+:root {
+  --bg:#090b13;
+  --card:#131725;
+  --red:#e83c50;
+  --red2:#ff6575;
+  --text:#f5f6fb;
+  --muted:#9299ac;
+  --border:rgba(255,255,255,.09);
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+
+body{
+  font-family:Inter,Arial,sans-serif;
+  background:
+    radial-gradient(ellipse at 50% 0%,rgba(232,60,80,.17),transparent 48%),
+    var(--bg);
+  color:var(--text);
+  min-height:100vh;
+  padding:20px;
+}
+
+.container{max-width:850px;margin:auto}
+
+header{
+  display:flex;justify-content:space-between;
+  align-items:center;padding:18px 0 35px;
+}
+
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{
+  width:43px;height:43px;border-radius:13px;
+  background:linear-gradient(135deg,#ff6575,#d51e3d);
+  display:grid;place-items:center;
+  font-size:23px;font-weight:900;
+  box-shadow:0 5px 25px #e83c5050;
+}
+.logo h2{font-size:19px;font-weight:800}
+.logo span{color:var(--red2)}
+
+.status{
+  border:1px solid #24583f;
+  background:#10271e;color:#64d99b;
+  padding:8px 12px;border-radius:30px;
+  font-size:11px;font-weight:700;
+}
+
+.hero{text-align:center;padding:38px 0 32px}
+
+.tag{
+  display:inline-block;
+  padding:8px 14px;border-radius:30px;
+  background:#e83c5018;color:#ff7887;
+  border:1px solid #e83c5035;
+  font-size:11px;font-weight:700;
+  letter-spacing:1px;
+}
+
+.hero h1{
+  font-size:clamp(30px,7vw,49px);
+  line-height:1.15;margin:22px 0 13px;
+  font-weight:900;letter-spacing:-1.5px;
+}
+.hero h1 span{
+  background:linear-gradient(90deg,#ff6476,#e83c50);
+  -webkit-background-clip:text;
+  color:transparent;
+}
+.hero p{
+  color:var(--muted);font-size:14px;
+  line-height:1.8;max-width:500px;margin:auto;
+}
+
+.main-card{
+  max-width:650px;margin:0 auto;
+  padding:27px;
+  border:1px solid var(--border);
+  border-radius:22px;
+  background:linear-gradient(145deg,#191e2d,#111522);
+  box-shadow:0 20px 65px #0006;
+}
+
+.label{
+  font-size:13px;font-weight:700;
+  display:block;margin-bottom:12px;
+}
+
+.input-wrap{position:relative}
+input{
+  width:100%;height:57px;
+  border:1px solid #333b50;
+  border-radius:12px;
+  background:#090d18;color:white;
+  padding:0 45px 0 15px;
+  font-size:13px;outline:none;
+  transition:.2s;
+}
+input:focus{border-color:var(--red)}
+input::placeholder{color:#737b8e}
+
+.clear{
+  position:absolute;right:12px;top:50%;
+  transform:translateY(-50%);
+  border:0;background:none;color:#9ba2b5;
+  font-size:20px;cursor:pointer;
+}
+
+.actions{
+  display:grid;grid-template-columns:1fr auto;
+  gap:10px;margin-top:15px;
+}
+
+button{cursor:pointer;font-family:inherit}
+
+.primary{
+  border:0;border-radius:12px;
+  background:linear-gradient(100deg,#e83c50,#ff6274);
+  color:white;font-size:14px;font-weight:800;
+  padding:17px;transition:.2s;
+  box-shadow:0 7px 22px #e83c5035;
+}
+.primary:active{transform:scale(.98)}
+.primary:disabled{opacity:.55;cursor:wait}
+
+.paste{
+  background:#242b3b;border:1px solid var(--border);
+  color:white;padding:0 19px;border-radius:12px;
+  font-weight:700;
+}
+
+.result{
+  display:none;margin-top:20px;
+  border:1px solid var(--border);
+  background:#0b101c;padding:19px;
+  border-radius:14px;
+}
+.result.show{display:block}
+
+.result-head{
+  display:flex;align-items:center;
+  gap:12px;margin-bottom:18px;
+}
+.file-icon{
+  width:45px;height:45px;
+  display:grid;place-items:center;
+  background:#e83c501b;border-radius:12px;
+  font-size:22px;
+}
+.file-name{font-size:14px;font-weight:700;overflow-wrap:anywhere}
+.file-sub{font-size:11px;color:var(--muted);margin-top:5px}
+
+.details{
+  display:grid;grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+.detail{
+  background:#171d2b;border-radius:10px;
+  padding:13px;
+}
+.detail small{color:var(--muted);font-size:10px}
+.detail strong{display:block;font-size:13px;margin-top:6px}
+
+.message{
+  margin-top:15px;font-size:12px;
+  color:var(--muted);line-height:1.6;
+}
+.error{color:#ff7d89}
+.success{color:#69dda0}
+
+.features{
+  display:grid;grid-template-columns:repeat(3,1fr);
+  gap:12px;margin:30px auto;
+  max-width:650px;
+}
+.feature{
+  text-align:center;padding:17px 8px;
+  border:1px solid var(--border);
+  border-radius:14px;background:#111522;
+}
+.feature .icon{font-size:22px;margin-bottom:10px}
+.feature strong{font-size:11px;display:block}
+.feature small{color:var(--muted);font-size:10px;display:block;margin-top:5px}
+
+footer{
+  text-align:center;color:#70788b;
+  font-size:11px;padding:25px 0;
+  border-top:1px solid var(--border);
+  line-height:2;
+}
+
+@media(max-width:500px){
+  body{padding:15px}
+  .main-card{padding:19px}
+  .hero{padding:28px 0}
+  .features{gap:7px}
+  .feature{padding:14px 4px}
+  .status{font-size:9px}
+}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">M</div>
+    <h2>MEGA<span>DL</span></h2>
+  </div>
+  <div class="status">● SYSTEM ONLINE</div>
+</header>
+
+<section class="hero">
+  <div class="tag">✦ PREMIUM DOWNLOAD EXPERIENCE</div>
+  <h1>Download Files<br><span>Without Limits.</span></h1>
+  <p>Paste your MEGA file link and retrieve file information instantly with our simple downloader.</p>
+</section>
+
+<main class="main-card">
+  <label class="label" for="url">MEGA DOWNLOAD LINK</label>
+
+  <div class="input-wrap">
+    <input id="url" type="url"
+      placeholder="https://mega.nz/file/..."
+      autocomplete="off">
+    <button class="clear" onclick="clearInput()" aria-label="Clear">×</button>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="generate" onclick="generate()">
+      ↗ Generate Download
+    </button>
+    <button class="paste" onclick="pasteLink()">Paste</button>
+  </div>
+
+  <div class="result" id="result">
+    <div class="result-head">
+      <div class="file-icon">📁</div>
+      <div>
+        <div class="file-name" id="fileName">File name</div>
+        <div class="file-sub">MEGA FILE INFORMATION</div>
+      </div>
+    </div>
+
+    <div class="details">
+      <div class="detail">
+        <small>FILE SIZE</small>
+        <strong id="fileSize">--</strong>
+      </div>
+      <div class="detail">
+        <small>FILE STATUS</small>
+        <strong class="success">Available</strong>
+      </div>
+    </div>
+    <div class="message" id="message"></div>
+  </div>
+</main>
+
+<section class="features">
+  <div class="feature">
+    <div class="icon">⚡</div>
+    <strong>Fast Processing</strong>
+    <small>Quick file lookup</small>
+  </div>
+  <div class="feature">
+    <div class="icon">🔒</div>
+    <strong>Secure</strong>
+    <small>Encrypted MEGA links</small>
+  </div>
+  <div class="feature">
+    <div class="icon">📱</div>
+    <strong>Mobile Ready</strong>
+    <small>Responsive design</small>
+  </div>
+</section>
+
+<footer>
+  MEGADL — Premium Downloader Interface<br>
+  Use only files you have permission to download.
+</footer>
+
+</div>
+
+<script>
+const input=document.getElementById("url");
+const result=document.getElementById("result");
+const button=document.getElementById("generate");
+
+function clearInput(){
+  input.value="";
+  result.classList.remove("show");
+}
+
+async function pasteLink(){
+  try{
+    input.value=await navigator.clipboard.readText();
+  }catch(e){
+    alert("Please paste your MEGA link manually.");
+  }
+}
+
+async function generate(){
+  const url=input.value.trim();
+  const message=document.getElementById("message");
+
+  if(!url){
+    alert("Please enter a MEGA link.");
+    return;
+  }
+
+  try{
+    const parsed=new URL(url);
+    if(!["mega.nz","www.mega.nz","mega.co.nz"].includes(parsed.hostname) ||
+       !parsed.pathname.startsWith("/file/")){
+      throw new Error("Please enter a valid public MEGA file link.");
+    }
+  }catch(e){
+    alert(e.message || "Invalid MEGA link.");
+    return;
+  }
+
+  button.disabled=true;
+  button.textContent="Processing...";
+  result.classList.add("show");
+  message.textContent="Connecting to MEGA...";
+  message.className="message";
+
+  try{
+    const response=await fetch("/api/info",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({url})
+    });
+
+    const data=await response.json();
+
+    if(!response.ok || !data.success){
+      throw new Error(data.error || "Unable to retrieve file information.");
+    }
+
+    document.getElementById("fileName").textContent=data.name;
+    document.getElementById("fileSize").textContent=data.sizeMB+" MB";
+
+    message.textContent="File information retrieved successfully.";
+    message.className="message success";
+
+  }catch(error){
+    message.textContent="Error: "+error.message;
+    message.className="message error";
+  }finally{
+    button.disabled=false;
+    button.textContent="↗ Generate Download";
+  }
+}
+</script>
+</body>
+</html>
