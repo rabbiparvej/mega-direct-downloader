@@ -1,384 +1,389 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="theme-color" content="#090b13">
-<title>MEGA Downloader — Premium</title>
+<meta name="theme-color" content="#10090d">
+<title>MEGADL - MEGA Downloader</title>
 
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
-
-:root {
-  --bg:#090b13;
-  --card:#131725;
-  --red:#e83c50;
-  --red2:#ff6575;
-  --text:#f5f6fb;
-  --muted:#9299ac;
-  --border:rgba(255,255,255,.09);
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
-*{box-sizing:border-box;margin:0;padding:0}
-
-body{
-  font-family:Inter,Arial,sans-serif;
-  background:
-    radial-gradient(ellipse at 50% 0%,rgba(232,60,80,.17),transparent 48%),
-    var(--bg);
-  color:var(--text);
-  min-height:100vh;
-  padding:20px;
+body {
+  font-family: Arial, sans-serif;
+  background: #10090d;
+  color: #fff;
+  min-height: 100vh;
+  padding: 25px 15px;
 }
 
-.container{max-width:850px;margin:auto}
-
-header{
-  display:flex;justify-content:space-between;
-  align-items:center;padding:18px 0 35px;
+.container {
+  max-width: 650px;
+  margin: 45px auto;
 }
 
-.logo{display:flex;align-items:center;gap:12px}
-.logo-icon{
-  width:43px;height:43px;border-radius:13px;
-  background:linear-gradient(135deg,#ff6575,#d51e3d);
-  display:grid;place-items:center;
-  font-size:23px;font-weight:900;
-  box-shadow:0 5px 25px #e83c5050;
-}
-.logo h2{font-size:19px;font-weight:800}
-.logo span{color:var(--red2)}
-
-.status{
-  border:1px solid #24583f;
-  background:#10271e;color:#64d99b;
-  padding:8px 12px;border-radius:30px;
-  font-size:11px;font-weight:700;
+.logo {
+  text-align: center;
+  font-size: 35px;
+  font-weight: 900;
+  color: #ff3155;
+  letter-spacing: 2px;
 }
 
-.hero{text-align:center;padding:38px 0 32px}
-
-.tag{
-  display:inline-block;
-  padding:8px 14px;border-radius:30px;
-  background:#e83c5018;color:#ff7887;
-  border:1px solid #e83c5035;
-  font-size:11px;font-weight:700;
-  letter-spacing:1px;
+.subtitle {
+  text-align: center;
+  color: #aaa;
+  margin-top: 10px;
+  font-size: 14px;
 }
 
-.hero h1{
-  font-size:clamp(30px,7vw,49px);
-  line-height:1.15;margin:22px 0 13px;
-  font-weight:900;letter-spacing:-1.5px;
-}
-.hero h1 span{
-  background:linear-gradient(90deg,#ff6476,#e83c50);
-  -webkit-background-clip:text;
-  color:transparent;
-}
-.hero p{
-  color:var(--muted);font-size:14px;
-  line-height:1.8;max-width:500px;margin:auto;
+.card {
+  background: #1b1118;
+  border: 1px solid #39202c;
+  border-radius: 18px;
+  padding: 25px;
+  margin-top: 30px;
+  box-shadow: 0 10px 35px #0008;
 }
 
-.main-card{
-  max-width:650px;margin:0 auto;
-  padding:27px;
-  border:1px solid var(--border);
-  border-radius:22px;
-  background:linear-gradient(145deg,#191e2d,#111522);
-  box-shadow:0 20px 65px #0006;
+.heading {
+  font-size: 20px;
+  margin-bottom: 10px;
 }
 
-.label{
-  font-size:13px;font-weight:700;
-  display:block;margin-bottom:12px;
+.description {
+  color: #aaa;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 22px;
 }
 
-.input-wrap{position:relative}
-input{
-  width:100%;height:57px;
-  border:1px solid #333b50;
-  border-radius:12px;
-  background:#090d18;color:white;
-  padding:0 45px 0 15px;
-  font-size:13px;outline:none;
-  transition:.2s;
-}
-input:focus{border-color:var(--red)}
-input::placeholder{color:#737b8e}
-
-.clear{
-  position:absolute;right:12px;top:50%;
-  transform:translateY(-50%);
-  border:0;background:none;color:#9ba2b5;
-  font-size:20px;cursor:pointer;
+.input-box {
+  width: 100%;
+  padding: 16px;
+  background: #10090d;
+  border: 1px solid #49303b;
+  border-radius: 10px;
+  color: white;
+  outline: none;
+  font-size: 14px;
 }
 
-.actions{
-  display:grid;grid-template-columns:1fr auto;
-  gap:10px;margin-top:15px;
+.input-box:focus {
+  border-color: #ff3155;
 }
 
-button{cursor:pointer;font-family:inherit}
-
-.primary{
-  border:0;border-radius:12px;
-  background:linear-gradient(100deg,#e83c50,#ff6274);
-  color:white;font-size:14px;font-weight:800;
-  padding:17px;transition:.2s;
-  box-shadow:0 7px 22px #e83c5035;
-}
-.primary:active{transform:scale(.98)}
-.primary:disabled{opacity:.55;cursor:wait}
-
-.paste{
-  background:#242b3b;border:1px solid var(--border);
-  color:white;padding:0 19px;border-radius:12px;
-  font-weight:700;
+.paste-btn {
+  width: 100%;
+  padding: 12px;
+  margin-top: 10px;
+  background: #30202a;
+  color: #fff;
+  border: 1px solid #49303b;
+  border-radius: 9px;
+  cursor: pointer;
 }
 
-.result{
-  display:none;margin-top:20px;
-  border:1px solid var(--border);
-  background:#0b101c;padding:19px;
-  border-radius:14px;
-}
-.result.show{display:block}
-
-.result-head{
-  display:flex;align-items:center;
-  gap:12px;margin-bottom:18px;
-}
-.file-icon{
-  width:45px;height:45px;
-  display:grid;place-items:center;
-  background:#e83c501b;border-radius:12px;
-  font-size:22px;
-}
-.file-name{font-size:14px;font-weight:700;overflow-wrap:anywhere}
-.file-sub{font-size:11px;color:var(--muted);margin-top:5px}
-
-.details{
-  display:grid;grid-template-columns:1fr 1fr;
-  gap:10px;
-}
-.detail{
-  background:#171d2b;border-radius:10px;
-  padding:13px;
-}
-.detail small{color:var(--muted);font-size:10px}
-.detail strong{display:block;font-size:13px;margin-top:6px}
-
-.message{
-  margin-top:15px;font-size:12px;
-  color:var(--muted);line-height:1.6;
-}
-.error{color:#ff7d89}
-.success{color:#69dda0}
-
-.features{
-  display:grid;grid-template-columns:repeat(3,1fr);
-  gap:12px;margin:30px auto;
-  max-width:650px;
-}
-.feature{
-  text-align:center;padding:17px 8px;
-  border:1px solid var(--border);
-  border-radius:14px;background:#111522;
-}
-.feature .icon{font-size:22px;margin-bottom:10px}
-.feature strong{font-size:11px;display:block}
-.feature small{color:var(--muted);font-size:10px;display:block;margin-top:5px}
-
-footer{
-  text-align:center;color:#70788b;
-  font-size:11px;padding:25px 0;
-  border-top:1px solid var(--border);
-  line-height:2;
+.generate-btn {
+  width: 100%;
+  padding: 16px;
+  margin-top: 18px;
+  background: linear-gradient(135deg, #ff3155, #d90035);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
 }
 
-@media(max-width:500px){
-  body{padding:15px}
-  .main-card{padding:19px}
-  .hero{padding:28px 0}
-  .features{gap:7px}
-  .feature{padding:14px 4px}
-  .status{font-size:9px}
+button:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.result {
+  display: none;
+  margin-top: 22px;
+  background: #120d11;
+  border: 1px solid #49303b;
+  border-radius: 12px;
+  padding: 18px;
+}
+
+.result h3 {
+  color: #ff5573;
+  margin-bottom: 15px;
+}
+
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid #35242d;
+  font-size: 14px;
+}
+
+.info-row span:first-child {
+  color: #aaa;
+}
+
+.info-row span:last-child {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.download-btn {
+  display: block;
+  width: 100%;
+  text-align: center;
+  text-decoration: none;
+  padding: 16px;
+  margin-top: 20px;
+  background: #13a76b;
+  color: white;
+  font-size: 16px;
+  font-weight: bold;
+  border-radius: 10px;
+}
+
+.download-btn:hover {
+  background: #0d8d59;
+}
+
+.status {
+  display: none;
+  margin-top: 15px;
+  padding: 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.error {
+  display: block;
+  background: #421923;
+  color: #ff9aaa;
+}
+
+.success {
+  display: block;
+  background: #123d2d;
+  color: #8df0bd;
+}
+
+.loading {
+  text-align: center;
+  color: #ff6680;
+  margin-top: 18px;
+  display: none;
+}
+
+.footer {
+  text-align: center;
+  color: #777;
+  font-size: 12px;
+  margin-top: 30px;
+  line-height: 1.8;
+}
+
+@media(max-width:480px) {
+  .container {
+    margin-top: 20px;
+  }
+  .card {
+    padding: 20px;
+  }
+  .logo {
+    font-size: 30px;
+  }
 }
 </style>
 </head>
 
 <body>
+
 <div class="container">
 
-<header>
-  <div class="logo">
-    <div class="logo-icon">M</div>
-    <h2>MEGA<span>DL</span></h2>
-  </div>
-  <div class="status">● SYSTEM ONLINE</div>
-</header>
+  <div class="logo">MEGADL</div>
+  <p class="subtitle">Simple & Secure MEGA Link Downloader</p>
 
-<section class="hero">
-  <div class="tag">✦ PREMIUM DOWNLOAD EXPERIENCE</div>
-  <h1>Download Files<br><span>Without Limits.</span></h1>
-  <p>Paste your MEGA file link and retrieve file information instantly with our simple downloader.</p>
-</section>
+  <div class="card">
 
-<main class="main-card">
-  <label class="label" for="url">MEGA DOWNLOAD LINK</label>
+    <h2 class="heading">Download Your File</h2>
 
-  <div class="input-wrap">
-    <input id="url" type="url"
-      placeholder="https://mega.nz/file/..."
-      autocomplete="off">
-    <button class="clear" onclick="clearInput()" aria-label="Clear">×</button>
-  </div>
+    <p class="description">
+      Paste your MEGA file link below to verify file information.
+    </p>
 
-  <div class="actions">
-    <button class="primary" id="generate" onclick="generate()">
-      ↗ Generate Download
+    <input
+      type="url"
+      id="megaUrl"
+      class="input-box"
+      placeholder="Paste your MEGA file link here..."
+      autocomplete="off"
+    >
+
+    <button class="paste-btn" id="pasteBtn" type="button">
+      📋 Paste MEGA Link
     </button>
-    <button class="paste" onclick="pasteLink()">Paste</button>
-  </div>
 
-  <div class="result" id="result">
-    <div class="result-head">
-      <div class="file-icon">📁</div>
-      <div>
-        <div class="file-name" id="fileName">File name</div>
-        <div class="file-sub">MEGA FILE INFORMATION</div>
-      </div>
+    <button class="generate-btn" id="generateBtn" type="button">
+      Generate Download
+    </button>
+
+    <div class="loading" id="loading">
+      Please wait... Checking MEGA file
     </div>
 
-    <div class="details">
-      <div class="detail">
-        <small>FILE SIZE</small>
-        <strong id="fileSize">--</strong>
+    <div class="status" id="status"></div>
+
+    <div class="result" id="result">
+
+      <h3>📁 File Information</h3>
+
+      <div class="info-row">
+        <span>File Name</span>
+        <span id="fileName">-</span>
       </div>
-      <div class="detail">
-        <small>FILE STATUS</small>
-        <strong class="success">Available</strong>
+
+      <div class="info-row">
+        <span>File Size</span>
+        <span id="fileSize">-</span>
       </div>
+
+      <a
+        href="#"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="download-btn"
+        id="downloadBtn"
+      >
+        ⬇ Download from MEGA
+      </a>
+
     </div>
-    <div class="message" id="message"></div>
-  </div>
-</main>
 
-<section class="features">
-  <div class="feature">
-    <div class="icon">⚡</div>
-    <strong>Fast Processing</strong>
-    <small>Quick file lookup</small>
   </div>
-  <div class="feature">
-    <div class="icon">🔒</div>
-    <strong>Secure</strong>
-    <small>Encrypted MEGA links</small>
-  </div>
-  <div class="feature">
-    <div class="icon">📱</div>
-    <strong>Mobile Ready</strong>
-    <small>Responsive design</small>
-  </div>
-</section>
 
-<footer>
-  MEGADL — Premium Downloader Interface<br>
-  Use only files you have permission to download.
-</footer>
+  <div class="footer">
+    MEGADL © 2026<br>
+    This website is an independent tool and is not affiliated with MEGA.
+  </div>
 
 </div>
 
 <script>
-const input=document.getElementById("url");
-const result=document.getElementById("result");
-const button=document.getElementById("generate");
+const input = document.getElementById("megaUrl");
+const generateBtn = document.getElementById("generateBtn");
+const pasteBtn = document.getElementById("pasteBtn");
+const loading = document.getElementById("loading");
+const statusBox = document.getElementById("status");
+const result = document.getElementById("result");
+const downloadBtn = document.getElementById("downloadBtn");
 
-function clearInput(){
-  input.value="";
-  result.classList.remove("show");
+function showStatus(message, type) {
+  statusBox.textContent = message;
+  statusBox.className = "status " + type;
 }
 
-async function pasteLink(){
-  try{
-    input.value=await navigator.clipboard.readText();
-  }catch(e){
-    alert("Please paste your MEGA link manually.");
+function hideStatus() {
+  statusBox.textContent = "";
+  statusBox.className = "status";
+}
+
+function validMegaLink(url) {
+  try {
+    const parsed = new URL(url);
+
+    return (
+      ["mega.nz", "www.mega.nz", "mega.co.nz"].includes(parsed.hostname) &&
+      parsed.pathname.startsWith("/file/")
+    );
+  } catch {
+    return false;
   }
 }
 
-async function generate(){
-  const url=input.value.trim();
-  const message=document.getElementById("message");
-
-  if(!url){
-    alert("Please enter a MEGA link.");
-    return;
+pasteBtn.addEventListener("click", async () => {
+  try {
+    const text = await navigator.clipboard.readText();
+    input.value = text.trim();
+    hideStatus();
+  } catch {
+    showStatus(
+      "Clipboard access unavailable. Please paste your link manually.",
+      "error"
+    );
   }
+});
 
-  try{
-    const parsed=new URL(url);
-    if(!["mega.nz","www.mega.nz","mega.co.nz"].includes(parsed.hostname) ||
-       !parsed.pathname.startsWith("/file/")){
-      throw new Error("Please enter a valid public MEGA file link.");
-    }
-  }catch(e){
-    alert(e.message || "Invalid MEGA link.");
-    return;
-  }
+generateBtn.addEventListener("click", async () => {
+  const url = input.value.trim();
 
-  button.disabled=true;
-  button.textContent="Processing...";
-  result.classList.add("show");
-  message.textContent="Connecting to MEGA...";
-  message.className="message";
-
-  try{
-    const response=await fetch("/api/info",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({url})
-    });
-
-    const data=await response.json();
-
-    if(!response.ok || !data.success){
-      throw new Error(data.error || "Unable to retrieve file information.");
-    }
-
-    document.getElementById("fileName").textContent=data.name;
-    document.getElementById("fileSize").textContent=data.sizeMB+" MB";
-
-    message.textContent="File information retrieved successfully.";
-    message.className="message success";
-
-  }catch(error){
-    message.textContent="Error: "+error.message;
-    message.className="message error";
-  }finally{
-    button.disabled=false;
-    button.textContent="↗ Generate Download";
-  }
-}
-</script> 
-  <button id="megaDownloadBtn" type="button">
-  Download from MEGA
-</button>
-
-<script>
-document.getElementById("megaDownloadBtn").addEventListener("click", () => {
-  const url = document.getElementById("megaUrl")?.value?.trim();
+  result.style.display = "none";
+  hideStatus();
 
   if (!url) {
-    alert("আগে MEGA link দিন।");
+    showStatus("Please enter a MEGA link first.", "error");
     return;
   }
 
-  window.open(url, "_blank");
+  if (!validMegaLink(url)) {
+    showStatus("Invalid MEGA file link. Please check your URL.", "error");
+    return;
+  }
+
+  generateBtn.disabled = true;
+  loading.style.display = "block";
+
+  try {
+    const response = await fetch("/api/info", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ url })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || "Unable to verify MEGA file.");
+    }
+
+    document.getElementById("fileName").textContent =
+      data.name || "Unknown";
+
+    document.getElementById("fileSize").textContent =
+      data.sizeMB ? data.sizeMB + " MB" : "Unknown";
+
+    downloadBtn.href = url;
+
+    result.style.display = "block";
+
+    showStatus(
+      "File information loaded successfully. Continue to MEGA to download.",
+      "success"
+    );
+
+  } catch (error) {
+    showStatus(
+      error.message || "Something went wrong. Please try again.",
+      "error"
+    );
+  } finally {
+    loading.style.display = "none";
+    generateBtn.disabled = false;
+  }
 });
 </script>
+
 </body>
 </html>
