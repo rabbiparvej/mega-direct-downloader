@@ -1,4 +1,5 @@
 const express = require('express');
+const zlib = require('zlib');
 const { Readable } = require('stream');
 const { File } = require('megajs');
 
@@ -9,11 +10,14 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = 30 * 60 * 1000;
 const MF_URL_TTL = 8 * 60 * 1000;
+const PD_API_KEY = process.env.PIXELDRAIN_API_KEY || '';
 const VIDEO_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|ts|3gp|mpg|mpeg|ogv)$/i;
 const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder|file)\/([A-Za-z0-9_-]+))?/i;
 const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
 const MF_FOLDER_RE = /mediafire\.com\/folder\/([A-Za-z0-9]+)/i;
 const MF_FILE_RE = /mediafire\.com\/(?:file|file_premium|view|download)\/([A-Za-z0-9]+)|mediafire\.com\/\?([A-Za-z0-9]+)/i;
+const PD_LIST_RE = /pixeldrain\.(?:com|net)\/l\/([A-Za-z0-9_-]+)/i;
+const PD_FILE_RE = /pixeldrain\.(?:com|net)\/(?:u|api\/file)\/([A-Za-z0-9_-]+)/i;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const BROWSER_HEADERS = {
   'User-Agent': UA,
@@ -31,6 +35,8 @@ const BROWSER_HEADERS = {
 const cache = new Map();
 const pending = new Map();
 const mfUrlCache = new Map();
+const pdZipCache = new Map();
+const pdZipPending = new Map();
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -93,6 +99,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [k, v] of cache) if (now - v.at > CACHE_TTL) cache.delete(k);
   for (const [k, v] of mfUrlCache) if (now - v.at > MF_URL_TTL) mfUrlCache.delete(k);
+  for (const [k, v] of pdZipCache) if (now - v.at > CACHE_TTL) pdZipCache.delete(k);
 }, 5 * 60 * 1000).unref();
 
 function baseUrl(req) {
@@ -109,6 +116,32 @@ function formatSize(bytes) {
     i++;
   }
   return n.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+}
+
+function videoMime(name) {
+  return /\.mp4$|\.m4v$/i.test(name) ? 'video/mp4'
+    : /\.webm$/i.test(name) ? 'video/webm'
+    : /\.mkv$/i.test(name) ? 'video/x-matroska'
+    : /\.mov$/i.test(name) ? 'video/quicktime'
+    : /\.ogv$/i.test(name) ? 'video/ogg'
+    : 'application/octet-stream';
+}
+
+function parseRangeHeader(range, size) {
+  if (!range) return { status: 200, start: 0, end: size - 1 };
+  const rm = /bytes=(\d*)-(\d*)/.exec(range);
+  if (!rm) return { status: 200, start: 0, end: size - 1 };
+
+  let start = 0;
+  let end = size - 1;
+  if (rm[1] !== '') {
+    start = parseInt(rm[1], 10);
+    if (rm[2] !== '') end = Math.min(parseInt(rm[2], 10), size - 1);
+  } else if (rm[2] !== '') {
+    start = Math.max(size - parseInt(rm[2], 10), 0);
+  }
+  if (start > end || start >= size) return { invalid: true };
+  return { status: 206, start, end };
 }
 
 async function listFolderLink(link, origin) {
@@ -340,13 +373,282 @@ async function listMfFile(link, origin) {
   };
 }
 
+function pdHeaders(extra = {}) {
+  const h = { 'User-Agent': UA, ...extra };
+  if (PD_API_KEY) {
+    h.Authorization = 'Basic ' + Buffer.from(':' + PD_API_KEY).toString('base64');
+  }
+  return h;
+}
+
+async function pdJson(path) {
+  const r = await fetch('https://pixeldrain.com/api/' + path, {
+    headers: pdHeaders({ Accept: 'application/json' }),
+    signal: AbortSignal.timeout(15000)
+  });
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || (j && j.success === false)) {
+    throw new Error((j && j.message) || 'PixelDrain error (' + r.status + ')');
+  }
+  return j;
+}
+
+async function pdFetchRange(fileId, start, end) {
+  const r = await fetch('https://pixeldrain.com/api/file/' + fileId, {
+    headers: pdHeaders({ Range: 'bytes=' + start + '-' + end }),
+    signal: AbortSignal.timeout(25000)
+  });
+  if (r.status !== 206 && r.status !== 200) {
+    try { await r.body.cancel(); } catch (e) {}
+    throw new Error('PixelDrain ZIP read failed (' + r.status + ')');
+  }
+  return Buffer.from(await r.arrayBuffer());
+}
+
+function findEocd(buf) {
+  let fallback = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      const commentLen = buf.readUInt16LE(i + 20);
+      if (i + 22 + commentLen === buf.length) return i;
+      if (fallback === -1) fallback = i;
+    }
+  }
+  return fallback;
+}
+
+async function parseRemoteZip(fileId, fileSize) {
+  if (!fileSize || fileSize < 22) throw new Error('Invalid or empty ZIP file');
+
+  const tailLen = Math.min(fileSize, 65557);
+  const tailStart = fileSize - tailLen;
+  const tailBuf = await pdFetchRange(fileId, tailStart, fileSize - 1);
+
+  const eocdPos = findEocd(tailBuf);
+  if (eocdPos < 0) throw new Error('ZIP directory not found');
+
+  let totalEntries = tailBuf.readUInt16LE(eocdPos + 10);
+  let cdSize = tailBuf.readUInt32LE(eocdPos + 12);
+  let cdOffset = tailBuf.readUInt32LE(eocdPos + 16);
+
+  if (cdOffset === 0xffffffff || cdSize === 0xffffffff || totalEntries === 0xffff) {
+    if (eocdPos >= 20 && tailBuf.readUInt32LE(eocdPos - 20) === 0x07064b50) {
+      const z64Off = Number(tailBuf.readBigUInt64LE(eocdPos - 20 + 8));
+      let z64Buf;
+      if (z64Off >= tailStart && z64Off + 56 <= fileSize) {
+        z64Buf = tailBuf.subarray(z64Off - tailStart);
+      } else {
+        z64Buf = await pdFetchRange(fileId, z64Off, Math.min(fileSize - 1, z64Off + 55));
+      }
+      if (z64Buf.length >= 56 && z64Buf.readUInt32LE(0) === 0x06064b50) {
+        cdSize = Number(z64Buf.readBigUInt64LE(40));
+        cdOffset = Number(z64Buf.readBigUInt64LE(48));
+      }
+    }
+  }
+
+  if (cdSize > 32 * 1024 * 1024) throw new Error('ZIP directory too large');
+
+  let cdBuf;
+  if (cdOffset >= tailStart && cdOffset + cdSize <= fileSize) {
+    cdBuf = tailBuf.subarray(cdOffset - tailStart, cdOffset - tailStart + cdSize);
+  } else {
+    cdBuf = await pdFetchRange(fileId, cdOffset, cdOffset + cdSize - 1);
+  }
+
+  const entries = [];
+  let p = 0;
+  while (p + 46 <= cdBuf.length && cdBuf.readUInt32LE(p) === 0x02014b50) {
+    const flags = cdBuf.readUInt16LE(p + 8);
+    const method = cdBuf.readUInt16LE(p + 10);
+    let compSize = cdBuf.readUInt32LE(p + 20);
+    let uncompSize = cdBuf.readUInt32LE(p + 24);
+    const nameLen = cdBuf.readUInt16LE(p + 28);
+    const extraLen = cdBuf.readUInt16LE(p + 30);
+    const commentLen = cdBuf.readUInt16LE(p + 32);
+    let localHeaderOffset = cdBuf.readUInt32LE(p + 42);
+
+    const enc = (flags & 0x0800) ? 'utf8' : 'latin1';
+    const rawName = cdBuf.subarray(p + 46, p + 46 + nameLen).toString(enc);
+
+    let ep = p + 46 + nameLen;
+    const extraEnd = ep + extraLen;
+    while (ep + 4 <= extraEnd) {
+      const eid = cdBuf.readUInt16LE(ep);
+      const esz = cdBuf.readUInt16LE(ep + 2);
+      if (eid === 0x0001 && ep + 4 + esz <= extraEnd) {
+        let zp = ep + 4;
+        if (uncompSize === 0xffffffff && zp + 8 <= ep + 4 + esz) {
+          uncompSize = Number(cdBuf.readBigUInt64LE(zp));
+          zp += 8;
+        }
+        if (compSize === 0xffffffff && zp + 8 <= ep + 4 + esz) {
+          compSize = Number(cdBuf.readBigUInt64LE(zp));
+          zp += 8;
+        }
+        if (localHeaderOffset === 0xffffffff && zp + 8 <= ep + 4 + esz) {
+          localHeaderOffset = Number(cdBuf.readBigUInt64LE(zp));
+        }
+        break;
+      }
+      ep += 4 + esz;
+    }
+
+    entries.push({
+      cdIndex: entries.length,
+      fullPath: rawName,
+      encrypted: (flags & 0x0001) !== 0,
+      method,
+      compSize,
+      uncompSize,
+      localHeaderOffset
+    });
+
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+async function getPdZip(fileId, knownInfo) {
+  const hit = pdZipCache.get(fileId);
+  if (hit && Date.now() - hit.at < CACHE_TTL) return hit;
+  if (pdZipPending.has(fileId)) return pdZipPending.get(fileId);
+
+  const job = (async () => {
+    const info = knownInfo || (await pdJson('file/' + fileId + '/info'));
+    const entries = await parseRemoteZip(fileId, info.size);
+    const data = { title: info.name || 'PixelDrain ZIP', entries, at: Date.now() };
+    pdZipCache.set(fileId, data);
+    return data;
+  })();
+
+  pdZipPending.set(fileId, job);
+  try {
+    return await job;
+  } finally {
+    pdZipPending.delete(fileId);
+  }
+}
+
+async function listPdFile(link, origin) {
+  const m = String(link).trim().match(PD_FILE_RE);
+  if (!m) throw new Error('Invalid PixelDrain file link');
+  const fileId = m[1];
+
+  const info = await pdJson('file/' + fileId + '/info');
+  const name = info.name || 'file';
+  const size = info.size || 0;
+  const isZip = /\.zip$/i.test(name) || /zip/i.test(info.mime_type || '');
+
+  if (isZip) {
+    const zip = await getPdZip(fileId, info);
+    const videos = zip.entries
+      .filter((e) => !e.fullPath.endsWith('/') && !/^__MACOSX\//i.test(e.fullPath))
+      .map((e) => {
+        const clean = e.fullPath.replace(/\\/g, '/').replace(/^\/+/, '');
+        const parts = clean.split('/').filter(Boolean);
+        const fileName = parts.pop() || clean;
+        return {
+          ...e,
+          name: fileName,
+          path: parts.join(' / ')
+        };
+      })
+      .filter((e) => VIDEO_EXT.test(e.name) && !e.encrypted);
+
+    if (!videos.length) {
+      throw new Error('No playable video files found inside this ZIP');
+    }
+
+    videos.sort((a, b) => collator.compare(a.path, b.path) || collator.compare(a.name, b.name));
+
+    const items = videos.map((v, i) => {
+      const dl = origin + '/pdz/' + fileId + '/' + v.cdIndex + '/' + encodeURIComponent(v.name);
+      return {
+        index: i + 1,
+        name: v.name,
+        path: v.path,
+        size: v.uncompSize,
+        sizeText: formatSize(v.uncompSize),
+        download: dl,
+        stream: dl + '?inline=1'
+      };
+    });
+
+    return {
+      ok: true,
+      title: name,
+      count: items.length,
+      totalSize: formatSize(items.reduce((s, x) => s + (x.size || 0), 0)),
+      items
+    };
+  }
+
+  const dl = origin + '/pd/' + fileId + '/' + encodeURIComponent(name);
+  return {
+    ok: true,
+    title: name,
+    count: 1,
+    totalSize: formatSize(size),
+    items: [
+      {
+        index: 1,
+        name,
+        path: '',
+        size,
+        sizeText: formatSize(size),
+        download: dl,
+        stream: dl + '?inline=1'
+      }
+    ]
+  };
+}
+
+async function listPdList(link, origin) {
+  const m = String(link).trim().match(PD_LIST_RE);
+  if (!m) throw new Error('Invalid PixelDrain list link');
+  const listId = m[1];
+
+  const data = await pdJson('list/' + listId);
+  const title = data.title || 'PixelDrain List';
+  const videos = (data.files || []).filter((f) => VIDEO_EXT.test(f.name || ''));
+
+  videos.sort((a, b) => collator.compare(a.name || '', b.name || ''));
+
+  const items = videos.map((f, i) => {
+    const name = f.name || 'video';
+    const dl = origin + '/pd/' + f.id + '/' + encodeURIComponent(name);
+    return {
+      index: i + 1,
+      name,
+      path: '',
+      size: f.size || 0,
+      sizeText: formatSize(f.size || 0),
+      download: dl,
+      stream: dl + '?inline=1'
+    };
+  });
+
+  return {
+    ok: true,
+    title,
+    count: items.length,
+    totalSize: formatSize(items.reduce((s, x) => s + (x.size || 0), 0)),
+    items
+  };
+}
+
 async function listLink(link, origin) {
   const text = String(link).trim();
   if (MEGA_RE.test(text)) return listFolderLink(text, origin);
   if (MEGA_FILE_RE.test(text)) return listSingleLink(text, origin);
   if (MF_FOLDER_RE.test(text)) return listMfFolder(text, origin);
   if (MF_FILE_RE.test(text)) return listMfFile(text, origin);
-  throw new Error('Invalid link (MEGA or MediaFire only)');
+  if (PD_LIST_RE.test(text)) return listPdList(text, origin);
+  if (PD_FILE_RE.test(text)) return listPdFile(text, origin);
+  throw new Error('Invalid link (MEGA, MediaFire or PixelDrain only)');
 }
 
 async function mfFromApi(quickKey) {
@@ -451,10 +753,7 @@ function sendNode(req, res, node) {
     }
   }
 
-  const mime = /\.mp4$|\.m4v$/i.test(name) ? 'video/mp4'
-    : /\.webm$/i.test(name) ? 'video/webm'
-    : /\.mkv$/i.test(name) ? 'video/x-matroska'
-    : 'application/octet-stream';
+  const mime = videoMime(name);
 
   res.status(status);
   res.set({
@@ -600,6 +899,164 @@ app.get('/mf/:key/:name?', async (req, res) => {
   }
 });
 
+app.get('/pd/:id/:name?', async (req, res) => {
+  const fileId = req.params.id;
+  const name = req.params.name || 'file';
+  const inline = req.query.inline === '1';
+
+  const ac = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort();
+  });
+
+  try {
+    const headers = pdHeaders();
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
+      headers,
+      redirect: 'follow',
+      signal: ac.signal
+    });
+
+    if (upstream.status !== 200 && upstream.status !== 206) {
+      try { await upstream.body.cancel(); } catch (e) {}
+      return res.redirect(302, 'https://pixeldrain.com/u/' + fileId);
+    }
+
+    res.status(upstream.status);
+    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    for (const h of pass) {
+      const v = upstream.headers.get(h);
+      if (v) res.set(h, v);
+    }
+    if (!upstream.headers.get('accept-ranges')) res.set('Accept-Ranges', 'bytes');
+    if (/\.mp4$|\.m4v$|\.webm$|\.mkv$/i.test(name)) {
+      res.set('Content-Type', videoMime(name));
+    }
+    res.set(
+      'Content-Disposition',
+      (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name)
+    );
+    res.set('Cache-Control', 'no-store');
+
+    const body = Readable.fromWeb(upstream.body);
+    body.on('error', () => res.destroy());
+    body.pipe(res);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return res.end();
+    if (res.headersSent) return res.destroy();
+    res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
+  }
+});
+
+app.get('/pdz/:id/:idx/:name?', async (req, res) => {
+  const fileId = req.params.id;
+  const idx = parseInt(req.params.idx, 10);
+  const inline = req.query.inline === '1';
+
+  const ac = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort();
+  });
+
+  try {
+    const zip = await getPdZip(fileId);
+    const entry = zip.entries[idx];
+    if (!entry) return res.status(404).send('File not found in ZIP');
+    if (entry.encrypted) return res.status(400).send('Encrypted ZIP entries are not supported');
+    if (entry.method !== 0 && entry.method !== 8) {
+      return res.status(415).send('Unsupported ZIP compression method (' + entry.method + ')');
+    }
+
+    if (entry.dataOffset === undefined) {
+      const lh = await pdFetchRange(fileId, entry.localHeaderOffset, entry.localHeaderOffset + 29);
+      if (lh.length < 30 || lh.readUInt32LE(0) !== 0x04034b50) {
+        return res.status(500).send('Invalid ZIP local header');
+      }
+      const lNameLen = lh.readUInt16LE(26);
+      const lExtraLen = lh.readUInt16LE(28);
+      entry.dataOffset = entry.localHeaderOffset + 30 + lNameLen + lExtraLen;
+    }
+
+    const name = req.params.name || entry.fullPath.split('/').pop() || 'video';
+    const mime = videoMime(name);
+    const disposition = (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name);
+
+    if (entry.method === 0) {
+      const size = entry.uncompSize;
+      const rInfo = parseRangeHeader(req.headers.range, size);
+      if (rInfo.invalid) {
+        res.status(416).set('Content-Range', 'bytes */' + size);
+        return res.end();
+      }
+
+      const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
+        headers: pdHeaders({
+          Range: 'bytes=' + (entry.dataOffset + rInfo.start) + '-' + (entry.dataOffset + rInfo.end)
+        }),
+        signal: ac.signal
+      });
+
+      if (upstream.status !== 200 && upstream.status !== 206) {
+        try { await upstream.body.cancel(); } catch (e) {}
+        return res.status(502).send('PixelDrain upstream error (' + upstream.status + ')');
+      }
+
+      res.status(rInfo.status);
+      res.set({
+        'Content-Type': mime,
+        'Content-Length': rInfo.end - rInfo.start + 1,
+        'Accept-Ranges': 'bytes',
+        'Content-Disposition': disposition,
+        'Cache-Control': 'no-store'
+      });
+      if (rInfo.status === 206) {
+        res.set('Content-Range', 'bytes ' + rInfo.start + '-' + rInfo.end + '/' + size);
+      }
+
+      const body = Readable.fromWeb(upstream.body);
+      body.on('error', () => res.destroy());
+      return body.pipe(res);
+    }
+
+    // Method 8 (Deflate): stream & decompress live
+    const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
+      headers: pdHeaders({
+        Range: 'bytes=' + entry.dataOffset + '-' + (entry.dataOffset + entry.compSize - 1)
+      }),
+      signal: ac.signal
+    });
+
+    if (upstream.status !== 200 && upstream.status !== 206) {
+      try { await upstream.body.cancel(); } catch (e) {}
+      return res.status(502).send('PixelDrain upstream error (' + upstream.status + ')');
+    }
+
+    res.status(200);
+    res.set({
+      'Content-Type': mime,
+      'Content-Length': entry.uncompSize,
+      'Accept-Ranges': 'none',
+      'Content-Disposition': disposition,
+      'Cache-Control': 'no-store'
+    });
+
+    const body = Readable.fromWeb(upstream.body);
+    const inflate = zlib.createInflateRaw();
+    body.on('error', () => { inflate.destroy(); res.destroy(); });
+    inflate.on('error', () => { body.destroy(); res.destroy(); });
+    res.on('close', () => {
+      if (!res.writableEnded) { body.destroy(); inflate.destroy(); }
+    });
+    body.pipe(inflate).pipe(res);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return res.end();
+    if (res.headersSent) return res.destroy();
+    res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PAGE = String.raw`<!DOCTYPE html>
@@ -730,6 +1187,7 @@ textarea::placeholder{color:var(--muted);opacity:.75}
 .src{font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px;letter-spacing:.04em}
 .src.mega{background:rgba(251,113,133,.14);color:var(--err);border:1px solid rgba(251,113,133,.35)}
 .src.mf{background:rgba(34,211,238,.12);color:var(--a2);border:1px solid rgba(34,211,238,.35)}
+.src.pd{background:rgba(139,92,246,.16);color:#c4b5fd;border:1px solid rgba(139,92,246,.4)}
 .f-tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .search,.select{padding:10px 14px;border-radius:11px;border:1px solid var(--line);background:var(--input);color:var(--text);font:500 13px 'Inter','Hind Siliguri',sans-serif;outline:none;transition:.2s}
 .search{min-width:180px}
@@ -816,17 +1274,18 @@ footer b{background:var(--grad);-webkit-background-clip:text;background-clip:tex
 
   <header class="hero">
     <h1>MegaDL Premium</h1>
-    <p>MEGA ও MediaFire এর Folder বা Single File লিংক দিন, মুহূর্তেই Direct Download ও Stream লিংক পেয়ে যান।</p>
+    <p>MEGA, MediaFire ও PixelDrain এর Folder, ZIP বা Single File লিংক দিন, মুহূর্তেই Direct Download ও Stream লিংক পেয়ে যান।</p>
     <div class="chips">
       <span class="chip"><b style="background:var(--err)"></b>MEGA Folder &amp; File</span>
       <span class="chip"><b style="background:var(--a2)"></b>MediaFire Folder &amp; File</span>
+      <span class="chip"><b style="background:var(--a1)"></b>PixelDrain Video &amp; ZIP</span>
       <span class="chip"><b style="background:var(--ok)"></b>Resume &amp; Stream Support</span>
     </div>
   </header>
 
   <section class="card input-card">
     <div class="ta-wrap">
-      <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA বা MediaFire লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://mega.nz/file/XXXXXXXX#YYYYYYYYYYYY&#10;https://www.mediafire.com/folder/XXXXXXXX/name&#10;https://www.mediafire.com/file/XXXXXXXX/name/file"></textarea>
+      <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA, MediaFire বা PixelDrain লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://www.mediafire.com/folder/XXXXXXXX/name&#10;https://pixeldrain.com/u/XXXXXXXX&#10;https://pixeldrain.com/l/XXXXXXXX"></textarea>
       <div class="ta-tools">
         <span class="counter" id="counter">0 লিংক</span>
         <span style="display:flex;gap:8px">
@@ -947,7 +1406,9 @@ function extOf(name) {
 }
 
 function srcOf(link) {
-  return /mediafire\.com/i.test(link) ? 'mf' : 'mega';
+  if (/mediafire\.com/i.test(link)) return 'mf';
+  if (/pixeldrain\.(?:com|net)/i.test(link)) return 'pd';
+  return 'mega';
 }
 
 function countLinks() {
@@ -1100,11 +1561,12 @@ function render(results) {
     }
 
     var s = srcOf(r.link);
-    var isFolder = r.items.length !== 1 || /folder/i.test(r.link);
+    var srcLabel = s === 'mf' ? 'MEDIAFIRE' : (s === 'pd' ? 'PIXELDRAIN' : 'MEGA');
+    var isFolder = r.items.length !== 1 || /folder|\/l\//i.test(r.link) || /\.zip$/i.test(r.title || '');
     el.innerHTML =
       '<div class="f-head"><div class="f-id"><div class="f-ico">' + (isFolder ? ICON_FOLDER : ICON_FILE) + '</div>' +
       '<div style="min-width:0"><div class="f-title">' + esc(r.title) + '</div>' +
-      '<div class="f-meta"><span class="src ' + s + '">' + (s === 'mf' ? 'MEDIAFIRE' : 'MEGA') + '</span>' +
+      '<div class="f-meta"><span class="src ' + s + '">' + srcLabel + '</span>' +
       '<span>' + r.count + ' ভিডিও · ' + esc(r.totalSize) + '</span></div></div></div>' +
       '<div class="f-tools">' +
       '<input class="search" placeholder="Search..." data-search="' + ri + '">' +
