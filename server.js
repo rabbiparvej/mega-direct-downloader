@@ -1521,7 +1521,7 @@ function extOf(name) {
 
 function srcOf(link) {
   if (/mediafire\.com/i.test(link)) return 'mf';
-  if (/pixeldrain\.(?:com|net)/i.test(link)) return 'pd';
+  if (/(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)/i.test(link)) return 'pd';
   return 'mega';
 }
 
