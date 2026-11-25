@@ -396,11 +396,14 @@ async function pdJson(path) {
 
 async function pdFetchRange(fileId, start, end) {
   const r = await fetch('https://pixeldrain.com/api/file/' + fileId, {
-    headers: pdHeaders({ Range: 'bytes=' + start + '-' + end }),
+    headers: pdHeaders({
+      'Accept-Encoding': 'identity',
+      Range: 'bytes=' + start + '-' + end
+    }),
     signal: AbortSignal.timeout(25000)
   });
   if (r.status !== 206 && r.status !== 200) {
-    try { await r.body.cancel(); } catch (e) {}
+    try { if (r.body) await r.body.cancel(); } catch (e) {}
     throw new Error('PixelDrain ZIP read failed (' + r.status + ')');
   }
   return Buffer.from(await r.arrayBuffer());
@@ -519,7 +522,12 @@ async function getPdZip(fileId, knownInfo) {
   const job = (async () => {
     const info = knownInfo || (await pdJson('file/' + fileId + '/info'));
     const entries = await parseRemoteZip(fileId, info.size);
-    const data = { title: info.name || 'PixelDrain ZIP', entries, at: Date.now() };
+    const data = {
+      title: info.name || 'PixelDrain ZIP',
+      dateUpload: info.date_upload || null,
+      entries,
+      at: Date.now()
+    };
     pdZipCache.set(fileId, data);
     return data;
   })();
@@ -903,6 +911,7 @@ app.get('/pd/:id/:name?', async (req, res) => {
   const fileId = req.params.id;
   const name = req.params.name || 'file';
   const inline = req.query.inline === '1';
+  const syntheticEtag = '"pd-' + fileId + '"';
 
   const ac = new AbortController();
   res.on('close', () => {
@@ -910,26 +919,54 @@ app.get('/pd/:id/:name?', async (req, res) => {
   });
 
   try {
-    const headers = pdHeaders();
+    const headers = pdHeaders({ 'Accept-Encoding': 'identity' });
     if (req.headers.range) headers.Range = req.headers.range;
+    if (req.headers['if-range'] && req.headers['if-range'] !== syntheticEtag) {
+      headers['If-Range'] = req.headers['if-range'];
+    }
 
     const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
+      method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers,
       redirect: 'follow',
       signal: ac.signal
     });
 
+    if (upstream.status === 416) {
+      const cr = upstream.headers.get('content-range');
+      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
+      res.status(416);
+      if (cr) res.set('Content-Range', cr);
+      return res.end();
+    }
+
+    if (upstream.status === 404) {
+      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
+      return res.status(404).send('File not found on PixelDrain');
+    }
+
     if (upstream.status !== 200 && upstream.status !== 206) {
-      try { await upstream.body.cancel(); } catch (e) {}
+      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
+      if (req.headers.range || req.method === 'HEAD') {
+        return res.status(upstream.status === 429 ? 429 : 503).send('PixelDrain temporarily unavailable');
+      }
       return res.redirect(302, 'https://pixeldrain.com/u/' + fileId);
     }
 
     res.status(upstream.status);
-    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified'];
     for (const h of pass) {
       const v = upstream.headers.get(h);
       if (v) res.set(h, v);
     }
+
+    const upEtag = upstream.headers.get('etag');
+    if (upEtag && !/^W\//i.test(upEtag)) {
+      res.set('ETag', upEtag);
+    } else {
+      res.set('ETag', syntheticEtag);
+    }
+
     if (!upstream.headers.get('accept-ranges')) res.set('Accept-Ranges', 'bytes');
     if (/\.mp4$|\.m4v$|\.webm$|\.mkv$/i.test(name)) {
       res.set('Content-Type', videoMime(name));
@@ -938,7 +975,12 @@ app.get('/pd/:id/:name?', async (req, res) => {
       'Content-Disposition',
       (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name)
     );
-    res.set('Cache-Control', 'no-store');
+    res.set('Cache-Control', 'private, no-cache');
+
+    if (req.method === 'HEAD') {
+      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
+      return res.end();
+    }
 
     const body = Readable.fromWeb(upstream.body);
     body.on('error', () => res.destroy());
@@ -982,37 +1024,67 @@ app.get('/pdz/:id/:idx/:name?', async (req, res) => {
     const name = req.params.name || entry.fullPath.split('/').pop() || 'video';
     const mime = videoMime(name);
     const disposition = (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name);
+    const size = entry.uncompSize;
+    const etag = '"pdz-' + fileId + '-' + idx + '-' + size + '"';
+    const lastMod = zip.dateUpload
+      ? new Date(zip.dateUpload).toUTCString()
+      : 'Thu, 01 Jan 2026 00:00:00 GMT';
+
+    if (size === 0) {
+      res.status(200).set({
+        'Content-Type': mime,
+        'Content-Length': 0,
+        'Accept-Ranges': 'bytes',
+        'Content-Disposition': disposition,
+        'ETag': etag,
+        'Last-Modified': lastMod,
+        'Cache-Control': 'private, no-cache'
+      });
+      return res.end();
+    }
+
+    let useRange = req.headers.range;
+    const ifRange = req.headers['if-range'];
+    if (useRange && ifRange && ifRange !== etag && ifRange !== lastMod) {
+      useRange = null;
+    }
+
+    const rInfo = parseRangeHeader(useRange, size);
+    if (rInfo.invalid) {
+      res.status(416).set('Content-Range', 'bytes */' + size);
+      return res.end();
+    }
+
+    res.status(rInfo.status);
+    res.set({
+      'Content-Type': mime,
+      'Content-Length': rInfo.end - rInfo.start + 1,
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': disposition,
+      'ETag': etag,
+      'Last-Modified': lastMod,
+      'Cache-Control': 'private, no-cache'
+    });
+    if (rInfo.status === 206) {
+      res.set('Content-Range', 'bytes ' + rInfo.start + '-' + rInfo.end + '/' + size);
+    }
+
+    if (req.method === 'HEAD') {
+      return res.end();
+    }
 
     if (entry.method === 0) {
-      const size = entry.uncompSize;
-      const rInfo = parseRangeHeader(req.headers.range, size);
-      if (rInfo.invalid) {
-        res.status(416).set('Content-Range', 'bytes */' + size);
-        return res.end();
-      }
-
       const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
         headers: pdHeaders({
+          'Accept-Encoding': 'identity',
           Range: 'bytes=' + (entry.dataOffset + rInfo.start) + '-' + (entry.dataOffset + rInfo.end)
         }),
         signal: ac.signal
       });
 
       if (upstream.status !== 200 && upstream.status !== 206) {
-        try { await upstream.body.cancel(); } catch (e) {}
+        try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
         return res.status(502).send('PixelDrain upstream error (' + upstream.status + ')');
-      }
-
-      res.status(rInfo.status);
-      res.set({
-        'Content-Type': mime,
-        'Content-Length': rInfo.end - rInfo.start + 1,
-        'Accept-Ranges': 'bytes',
-        'Content-Disposition': disposition,
-        'Cache-Control': 'no-store'
-      });
-      if (rInfo.status === 206) {
-        res.set('Content-Range', 'bytes ' + rInfo.start + '-' + rInfo.end + '/' + size);
       }
 
       const body = Readable.fromWeb(upstream.body);
@@ -1020,36 +1092,78 @@ app.get('/pdz/:id/:idx/:name?', async (req, res) => {
       return body.pipe(res);
     }
 
-    // Method 8 (Deflate): stream & decompress live
     const upstream = await fetch('https://pixeldrain.com/api/file/' + fileId, {
       headers: pdHeaders({
+        'Accept-Encoding': 'identity',
         Range: 'bytes=' + entry.dataOffset + '-' + (entry.dataOffset + entry.compSize - 1)
       }),
       signal: ac.signal
     });
 
     if (upstream.status !== 200 && upstream.status !== 206) {
-      try { await upstream.body.cancel(); } catch (e) {}
+      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
       return res.status(502).send('PixelDrain upstream error (' + upstream.status + ')');
     }
 
-    res.status(200);
-    res.set({
-      'Content-Type': mime,
-      'Content-Length': entry.uncompSize,
-      'Accept-Ranges': 'none',
-      'Content-Disposition': disposition,
-      'Cache-Control': 'no-store'
-    });
-
     const body = Readable.fromWeb(upstream.body);
     const inflate = zlib.createInflateRaw();
-    body.on('error', () => { inflate.destroy(); res.destroy(); });
-    inflate.on('error', () => { body.destroy(); res.destroy(); });
-    res.on('close', () => {
-      if (!res.writableEnded) { body.destroy(); inflate.destroy(); }
+    const start = rInfo.start;
+    const needed = rInfo.end - rInfo.start + 1;
+    let pos = 0;
+    let sent = 0;
+    let finished = false;
+
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      ac.abort();
+      body.destroy();
+      inflate.destroy();
+    };
+
+    inflate.on('data', (chunk) => {
+      if (finished) return;
+      const chunkStart = pos;
+      const chunkEnd = pos + chunk.length;
+      pos = chunkEnd;
+
+      if (chunkEnd <= start) return;
+      if (sent >= needed) return;
+
+      const sliceFrom = Math.max(0, start - chunkStart);
+      const remaining = needed - sent;
+      const sliceTo = Math.min(chunk.length, sliceFrom + remaining);
+      if (sliceTo > sliceFrom) {
+        const out = (sliceFrom === 0 && sliceTo === chunk.length)
+          ? chunk
+          : chunk.subarray(sliceFrom, sliceTo);
+        sent += out.length;
+        if (!res.write(out)) inflate.pause();
+      }
+      if (sent >= needed) {
+        res.end();
+        cleanup();
+      }
     });
-    body.pipe(inflate).pipe(res);
+
+    res.on('drain', () => {
+      if (!finished) inflate.resume();
+    });
+
+    inflate.on('end', () => {
+      if (!finished) {
+        finished = true;
+        res.end();
+      }
+    });
+
+    body.on('error', () => { cleanup(); res.destroy(); });
+    inflate.on('error', () => { cleanup(); res.destroy(); });
+    res.on('close', () => {
+      if (!res.writableEnded) cleanup();
+    });
+
+    body.pipe(inflate);
   } catch (err) {
     if (err && err.name === 'AbortError') return res.end();
     if (res.headersSent) return res.destroy();
@@ -1742,4 +1856,6 @@ countLinks();
 
 app.get('/', (req, res) => res.type('html').send(PAGE));
 
-app.listen(PORT, () => console.log('MegaDL running on port ' + PORT));
+const server = app.listen(PORT, () => console.log('MegaDL running on port ' + PORT));
+server.requestTimeout = 0;
+server.setTimeout(0);
