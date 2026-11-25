@@ -266,8 +266,9 @@ textarea:focus{border-color:var(--a1);box-shadow:0 0 0 4px rgba(124,92,255,.18)}
 .btn-ghost{background:var(--panel-2);border:1px solid var(--line)}
 .btn-ghost:hover{background:rgba(255,255,255,.12)}
 .btn-sm{padding:9px 14px;font-size:13px;border-radius:10px}
-.btn.done{background:rgba(52,211,153,.18);border-color:var(--ok);color:var(--ok)}
+.btn.done{background:rgba(52,211,153,.18);border:1px solid var(--ok);color:var(--ok);box-shadow:none}
 #results{margin-top:28px;display:grid;gap:22px}
+.topbar{padding:20px 22px;display:flex;gap:14px;justify-content:space-between;align-items:center;flex-wrap:wrap;border-color:rgba(124,92,255,.35);background:linear-gradient(120deg,rgba(124,92,255,.14),rgba(34,211,238,.08));animation:rise .5s ease both}
 .folder{overflow:hidden;animation:rise .5s ease both}
 @keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
 .f-head{padding:20px 22px;display:flex;gap:14px;justify-content:space-between;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.04),transparent)}
@@ -298,6 +299,8 @@ footer{text-align:center;margin-top:50px;color:var(--muted);font-size:13px}
   .actions .btn{flex:1}
   .f-head{padding:16px}
   .search{flex:1}
+  .topbar{padding:16px}
+  .topbar .btn{width:100%}
 }
 </style>
 </head>
@@ -355,6 +358,17 @@ function copyText(text) {
   });
 }
 
+function flash(btn, msg) {
+  var old = btn.getAttribute('data-label') || btn.textContent;
+  btn.setAttribute('data-label', old);
+  btn.textContent = msg;
+  btn.classList.add('done');
+  setTimeout(function () {
+    btn.textContent = old;
+    btn.classList.remove('done');
+  }, 1500);
+}
+
 function itemHtml(it) {
   return '<li class="item" data-name="' + esc((it.path + ' ' + it.name).toLowerCase()) + '">' +
     '<div class="idx">' + it.index + '</div>' +
@@ -370,6 +384,20 @@ function itemHtml(it) {
 function render(results) {
   var box = $('#results');
   box.innerHTML = '';
+
+  var total = 0;
+  results.forEach(function (r) { if (r.ok) total += r.items.length; });
+
+  if (total > 0) {
+    var bar = document.createElement('div');
+    bar.className = 'card topbar';
+    bar.innerHTML =
+      '<div><div class="f-title">সব ফাইলের Direct Download লিংক</div>' +
+      '<div class="f-meta">মোট ' + total + ' টি ফাইল</div></div>' +
+      '<button class="btn btn-primary" data-copyevery="1">Copy All File Links</button>';
+    box.appendChild(bar);
+  }
+
   results.forEach(function (r, ri) {
     var el = document.createElement('section');
     el.className = 'card folder';
@@ -385,7 +413,7 @@ function render(results) {
       '<div class="f-head"><div><div class="f-title">' + esc(r.title) + '</div>' +
       '<div class="f-meta">' + r.count + ' ভিডিও · ' + esc(r.totalSize) + '</div></div>' +
       '<div class="f-tools"><input class="search" placeholder="Search..." data-search="' + ri + '">' +
-      '<button class="btn btn-ghost btn-sm" data-copyall="' + ri + '">Copy All Links</button></div></div>' + body;
+      '<button class="btn btn-ghost btn-sm" data-copyall="' + ri + '">Copy Folder Links</button></div></div>' + body;
     box.appendChild(el);
   });
 
@@ -393,19 +421,33 @@ function render(results) {
     var c = e.target.closest('[data-copy]');
     if (c) {
       copyText(c.getAttribute('data-copy')).then(function () {
-        var old = c.textContent;
-        c.textContent = 'Copied!';
-        c.classList.add('done');
+        flash(c, 'Copied!');
         toast('Link copied');
-        setTimeout(function () { c.textContent = old; c.classList.remove('done'); }, 1400);
       });
       return;
     }
+
+    var ev = e.target.closest('[data-copyevery]');
+    if (ev) {
+      var every = [];
+      results.forEach(function (r) {
+        if (r.ok) r.items.forEach(function (x) { every.push(x.download); });
+      });
+      copyText(every.join('\n')).then(function () {
+        flash(ev, 'Copied ' + every.length + ' Links!');
+        toast(every.length + ' টি লিংক কপি হয়েছে');
+      });
+      return;
+    }
+
     var a = e.target.closest('[data-copyall]');
     if (a) {
       var r = results[parseInt(a.getAttribute('data-copyall'), 10)];
       var text = r.items.map(function (x) { return x.download; }).join('\n');
-      copyText(text).then(function () { toast(r.items.length + ' টি লিংক কপি হয়েছে'); });
+      copyText(text).then(function () {
+        flash(a, 'Copied!');
+        toast(r.items.length + ' টি লিংক কপি হয়েছে');
+      });
     }
   };
 
