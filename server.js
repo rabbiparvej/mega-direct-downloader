@@ -16,8 +16,8 @@ const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder
 const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
 const MF_FOLDER_RE = /mediafire\.com\/folder\/([A-Za-z0-9]+)/i;
 const MF_FILE_RE = /mediafire\.com\/(?:file|file_premium|view|download)\/([A-Za-z0-9]+)|mediafire\.com\/\?([A-Za-z0-9]+)/i;
-const PD_LIST_RE = /pixeldrain\.(?:com|net)\/l\/([A-Za-z0-9_-]+)/i;
-const PD_FILE_RE = /pixeldrain\.(?:com|net)\/(?:u|api\/file)\/([A-Za-z0-9_-]+)/i;
+const PD_LIST_RE = /(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)\/l\/([A-Za-z0-9_-]+)/i;
+const PD_FILE_RE = /(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)\/(?:u|api\/file)\/([A-Za-z0-9_-]+)/i;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const BROWSER_HEADERS = {
   'User-Agent': UA,
