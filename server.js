@@ -1,4 +1,5 @@
 const express = require('express');
+const { Readable } = require('stream');
 const { File } = require('megajs');
 
 const app = express();
@@ -7,12 +8,17 @@ app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = 30 * 60 * 1000;
+const MF_URL_TTL = 8 * 60 * 1000;
 const VIDEO_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|ts|3gp|mpg|mpeg|ogv)$/i;
 const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder|file)\/([A-Za-z0-9_-]+))?/i;
 const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
+const MF_FOLDER_RE = /mediafire\.com\/folder\/([A-Za-z0-9]+)/i;
+const MF_FILE_RE = /mediafire\.com\/(?:file|file_premium|view|download)\/([A-Za-z0-9]+)|mediafire\.com\/\?([A-Za-z0-9]+)/i;
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 const cache = new Map();
 const pending = new Map();
+const mfUrlCache = new Map();
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -74,6 +80,7 @@ async function getSingleFile(fileId, key) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of cache) if (now - v.at > CACHE_TTL) cache.delete(k);
+  for (const [k, v] of mfUrlCache) if (now - v.at > MF_URL_TTL) mfUrlCache.delete(k);
 }, 5 * 60 * 1000).unref();
 
 function baseUrl(req) {
@@ -182,11 +189,192 @@ async function listSingleLink(link, origin) {
   };
 }
 
+async function mfApi(path, params) {
+  const qs = new URLSearchParams({ ...params, response_format: 'json' });
+  const r = await fetch('https://www.mediafire.com/api/1.5/' + path + '?' + qs.toString(), {
+    headers: { 'User-Agent': UA, Accept: 'application/json' }
+  });
+  if (!r.ok) throw new Error('MediaFire API error (' + r.status + ')');
+  const j = await r.json();
+  const resp = j && j.response;
+  if (!resp || resp.result !== 'Success') {
+    throw new Error((resp && resp.message) || 'MediaFire request failed');
+  }
+  return resp;
+}
+
+async function mfCollect(folderKey, pathParts, out, depth) {
+  let chunk = 1;
+  while (chunk <= 50) {
+    const d = await mfApi('folder/get_content.php', {
+      folder_key: folderKey,
+      content_type: 'files',
+      chunk: String(chunk),
+      chunk_size: '1000'
+    });
+    const fc = d.folder_content || {};
+    for (const f of fc.files || []) {
+      out.push({
+        key: f.quickkey,
+        name: f.filename,
+        size: parseInt(f.size, 10) || 0,
+        parts: pathParts
+      });
+    }
+    if (fc.more_chunks === 'yes') chunk++;
+    else break;
+  }
+
+  if (depth >= 6) return;
+
+  chunk = 1;
+  while (chunk <= 50) {
+    const d = await mfApi('folder/get_content.php', {
+      folder_key: folderKey,
+      content_type: 'folders',
+      chunk: String(chunk),
+      chunk_size: '1000'
+    });
+    const fc = d.folder_content || {};
+    for (const sub of fc.folders || []) {
+      await mfCollect(sub.folderkey, pathParts.concat(sub.name || ''), out, depth + 1);
+    }
+    if (fc.more_chunks === 'yes') chunk++;
+    else break;
+  }
+}
+
+async function listMfFolder(link, origin) {
+  const m = String(link).trim().match(MF_FOLDER_RE);
+  if (!m) throw new Error('Invalid MediaFire folder link');
+  const folderKey = m[1];
+
+  let title = 'MediaFire Folder';
+  try {
+    const info = await mfApi('folder/get_info.php', { folder_key: folderKey });
+    if (info.folder_info && info.folder_info.name) title = info.folder_info.name;
+  } catch (e) {}
+
+  const all = [];
+  await mfCollect(folderKey, [], all, 0);
+
+  const videos = all
+    .filter((f) => VIDEO_EXT.test(f.name || ''))
+    .map((f) => ({ ...f, path: f.parts.join(' / ') }));
+
+  videos.sort((a, b) => collator.compare(a.path, b.path) || collator.compare(a.name, b.name));
+
+  const items = videos.map((v, i) => {
+    const dl = origin + '/mf/' + v.key + '/' + encodeURIComponent(v.name);
+    return {
+      index: i + 1,
+      name: v.name,
+      path: v.path,
+      size: v.size,
+      sizeText: formatSize(v.size),
+      download: dl,
+      stream: dl + '?inline=1'
+    };
+  });
+
+  return {
+    ok: true,
+    title,
+    count: items.length,
+    totalSize: formatSize(items.reduce((s, x) => s + (x.size || 0), 0)),
+    items
+  };
+}
+
+async function listMfFile(link, origin) {
+  const m = String(link).trim().match(MF_FILE_RE);
+  if (!m) throw new Error('Invalid MediaFire file link');
+  const quickKey = m[1] || m[2];
+
+  let name = '';
+  let size = 0;
+  try {
+    const info = await mfApi('file/get_info.php', { quick_key: quickKey });
+    if (info.file_info) {
+      name = info.file_info.filename || '';
+      size = parseInt(info.file_info.size, 10) || 0;
+    }
+  } catch (e) {}
+
+  if (!name) {
+    const parts = String(link).split('?')[0].split('/').filter(Boolean);
+    const last = parts[parts.length - 1];
+    name = last && last !== 'file' ? decodeURIComponent(last) : parts[parts.length - 2] || 'file';
+  }
+
+  const dl = origin + '/mf/' + quickKey + '/' + encodeURIComponent(name);
+
+  return {
+    ok: true,
+    title: name,
+    count: 1,
+    totalSize: formatSize(size),
+    items: [
+      {
+        index: 1,
+        name,
+        path: '',
+        size,
+        sizeText: formatSize(size),
+        download: dl,
+        stream: dl + '?inline=1'
+      }
+    ]
+  };
+}
+
 async function listLink(link, origin) {
   const text = String(link).trim();
   if (MEGA_RE.test(text)) return listFolderLink(text, origin);
   if (MEGA_FILE_RE.test(text)) return listSingleLink(text, origin);
-  throw new Error('Invalid MEGA link');
+  if (MF_FOLDER_RE.test(text)) return listMfFolder(text, origin);
+  if (MF_FILE_RE.test(text)) return listMfFile(text, origin);
+  throw new Error('Invalid link (MEGA or MediaFire only)');
+}
+
+async function resolveMf(quickKey, fresh) {
+  const hit = mfUrlCache.get(quickKey);
+  if (!fresh && hit && Date.now() - hit.at < MF_URL_TTL) return hit.url;
+
+  const r = await fetch('https://www.mediafire.com/file/' + quickKey + '/file', {
+    headers: { 'User-Agent': UA, Accept: 'text/html,*/*' },
+    redirect: 'follow'
+  });
+  if (!r.ok) throw new Error('MediaFire page error (' + r.status + ')');
+
+  const ct = r.headers.get('content-type') || '';
+  let url = null;
+
+  if (!/text\/html/i.test(ct)) {
+    url = r.url;
+    try { await r.body.cancel(); } catch (e) {}
+  } else {
+    const html = await r.text();
+    let m = html.match(/data-scrambled-url="([^"]+)"/i);
+    if (m) {
+      try {
+        url = Buffer.from(m[1], 'base64').toString('utf8');
+      } catch (e) {}
+    }
+    if (!url || !/^https?:\/\//i.test(url)) {
+      m = html.match(/href="(https?:\/\/download[0-9]*\.mediafire\.com\/[^"]+)"/i);
+      url = m ? m[1] : null;
+    }
+    if (!url) {
+      m = html.match(/(https?:\/\/download[0-9]*\.mediafire\.com\/[^\s"'<>]+)/i);
+      url = m ? m[1] : null;
+    }
+    if (url) url = url.replace(/&amp;/g, '&');
+  }
+
+  if (!url) throw new Error('Direct link not found (file removed or blocked)');
+  mfUrlCache.set(quickKey, { url, at: Date.now() });
+  return url;
 }
 
 function sendNode(req, res, node) {
@@ -302,6 +490,55 @@ app.get('/dlf/:fileId/:name?', async (req, res) => {
   }
 });
 
+app.get('/mf/:key/:name?', async (req, res) => {
+  const quickKey = req.params.key;
+  const name = req.params.name || 'file';
+  const inline = req.query.inline === '1';
+
+  const ac = new AbortController();
+  res.on('close', () => ac.abort());
+
+  try {
+    let upstream;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const url = await resolveMf(quickKey, attempt > 0);
+      const headers = { 'User-Agent': UA, Referer: 'https://www.mediafire.com/' };
+      if (req.headers.range) headers.Range = req.headers.range;
+
+      upstream = await fetch(url, { headers, redirect: 'follow', signal: ac.signal });
+      const ct = upstream.headers.get('content-type') || '';
+      const good = (upstream.status === 200 || upstream.status === 206) && !/text\/html/i.test(ct);
+      if (good) break;
+      try { await upstream.body.cancel(); } catch (e) {}
+      mfUrlCache.delete(quickKey);
+      upstream = null;
+    }
+
+    if (!upstream) return res.status(502).send('MediaFire did not return the file (blocked or expired). Try again.');
+
+    res.status(upstream.status);
+    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    for (const h of pass) {
+      const v = upstream.headers.get(h);
+      if (v) res.set(h, v);
+    }
+    if (!upstream.headers.get('accept-ranges')) res.set('Accept-Ranges', 'bytes');
+    res.set(
+      'Content-Disposition',
+      (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name)
+    );
+    res.set('Cache-Control', 'no-store');
+
+    const body = Readable.fromWeb(upstream.body);
+    body.on('error', () => res.destroy());
+    body.pipe(res);
+  } catch (err) {
+    if (res.headersSent) return res.destroy();
+    if (err && err.name === 'AbortError') return res.end();
+    res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PAGE = String.raw`<!DOCTYPE html>
@@ -387,11 +624,11 @@ footer{text-align:center;margin-top:50px;color:var(--muted);font-size:13px}
   <header>
     <span class="badge"><i></i> Online</span>
     <h1>MegaDL Premium</h1>
-    <p>MEGA Folder বা Single File লিংক দিন — Direct Download লিংক পেয়ে যান</p>
+    <p>MEGA ও MediaFire — Folder বা Single File লিংক দিন, Direct Download লিংক পেয়ে যান</p>
   </header>
 
   <section class="card input-card">
-    <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://mega.nz/file/XXXXXXXX#YYYYYYYYYYYY"></textarea>
+    <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA বা MediaFire লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://mega.nz/file/XXXXXXXX#YYYYYYYYYYYY&#10;https://www.mediafire.com/folder/XXXXXXXX/name&#10;https://www.mediafire.com/file/XXXXXXXX/name/file"></textarea>
     <div class="row">
       <span class="hint">Folder ও Single File দুটোই দেওয়া যাবে, একসাথে একাধিক (সর্বোচ্চ ২০টি)</span>
       <button class="btn btn-primary" id="go">Generate Links</button>
