@@ -14,7 +14,19 @@ const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder
 const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
 const MF_FOLDER_RE = /mediafire\.com\/folder\/([A-Za-z0-9]+)/i;
 const MF_FILE_RE = /mediafire\.com\/(?:file|file_premium|view|download)\/([A-Za-z0-9]+)|mediafire\.com\/\?([A-Za-z0-9]+)/i;
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Cache-Control': 'no-cache',
+  Pragma: 'no-cache',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1'
+};
 
 const cache = new Map();
 const pending = new Map();
@@ -337,24 +349,49 @@ async function listLink(link, origin) {
   throw new Error('Invalid link (MEGA or MediaFire only)');
 }
 
-async function resolveMf(quickKey, fresh) {
-  const hit = mfUrlCache.get(quickKey);
-  if (!fresh && hit && Date.now() - hit.at < MF_URL_TTL) return hit.url;
+async function mfFromApi(quickKey) {
+  try {
+    const d = await mfApi('file/get_links.php', {
+      quick_key: quickKey,
+      link_type: 'direct_download'
+    });
+    const l = d.links && d.links[0];
+    const url = l && (l.direct_download || l.normal_download);
+    if (url && /^https?:\/\/download/i.test(url)) return url;
+  } catch (e) {}
+  return null;
+}
 
-  const r = await fetch('https://www.mediafire.com/file/' + quickKey + '/file', {
-    headers: { 'User-Agent': UA, Accept: 'text/html,*/*' },
-    redirect: 'follow'
-  });
-  if (!r.ok) throw new Error('MediaFire page error (' + r.status + ')');
+async function mfFromPage(quickKey) {
+  const pages = [
+    'https://www.mediafire.com/file/' + quickKey + '/file',
+    'https://www.mediafire.com/download/' + quickKey
+  ];
 
-  const ct = r.headers.get('content-type') || '';
-  let url = null;
+  for (const page of pages) {
+    let r;
+    try {
+      r = await fetch(page, {
+        headers: { ...BROWSER_HEADERS, Referer: 'https://www.mediafire.com/' },
+        redirect: 'follow'
+      });
+    } catch (e) {
+      continue;
+    }
+    if (!r.ok) {
+      try { await r.body.cancel(); } catch (e) {}
+      continue;
+    }
 
-  if (!/text\/html/i.test(ct)) {
-    url = r.url;
-    try { await r.body.cancel(); } catch (e) {}
-  } else {
+    const ct = r.headers.get('content-type') || '';
+    if (!/text\/html/i.test(ct)) {
+      const direct = r.url;
+      try { await r.body.cancel(); } catch (e) {}
+      return direct;
+    }
+
     const html = await r.text();
+    let url = null;
     let m = html.match(/data-scrambled-url="([^"]+)"/i);
     if (m) {
       try {
@@ -369,10 +406,19 @@ async function resolveMf(quickKey, fresh) {
       m = html.match(/(https?:\/\/download[0-9]*\.mediafire\.com\/[^\s"'<>]+)/i);
       url = m ? m[1] : null;
     }
-    if (url) url = url.replace(/&amp;/g, '&');
+    if (url) return url.replace(/&amp;/g, '&');
   }
+  return null;
+}
 
-  if (!url) throw new Error('Direct link not found (file removed or blocked)');
+async function resolveMf(quickKey, fresh) {
+  const hit = mfUrlCache.get(quickKey);
+  if (!fresh && hit && Date.now() - hit.at < MF_URL_TTL) return hit.url;
+
+  let url = await mfFromApi(quickKey);
+  if (!url) url = await mfFromPage(quickKey);
+  if (!url) throw new Error('Direct link not found');
+
   mfUrlCache.set(quickKey, { url, at: Date.now() });
   return url;
 }
@@ -498,24 +544,40 @@ app.get('/mf/:key/:name?', async (req, res) => {
   const ac = new AbortController();
   res.on('close', () => ac.abort());
 
-  try {
-    let upstream;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const url = await resolveMf(quickKey, attempt > 0);
-      const headers = { 'User-Agent': UA, Referer: 'https://www.mediafire.com/' };
+  let upstream = null;
+  let lastUrl = null;
+
+  for (let attempt = 0; attempt < 2 && !upstream; attempt++) {
+    try {
+      lastUrl = await resolveMf(quickKey, attempt > 0);
+      const headers = {
+        'User-Agent': UA,
+        Referer: 'https://www.mediafire.com/',
+        'Accept-Language': 'en-US,en;q=0.9'
+      };
       if (req.headers.range) headers.Range = req.headers.range;
 
-      upstream = await fetch(url, { headers, redirect: 'follow', signal: ac.signal });
-      const ct = upstream.headers.get('content-type') || '';
-      const good = (upstream.status === 200 || upstream.status === 206) && !/text\/html/i.test(ct);
-      if (good) break;
-      try { await upstream.body.cancel(); } catch (e) {}
+      const r = await fetch(lastUrl, { headers, redirect: 'follow', signal: ac.signal });
+      const ct = r.headers.get('content-type') || '';
+      const good = (r.status === 200 || r.status === 206) && !/text\/html/i.test(ct);
+      if (good) {
+        upstream = r;
+      } else {
+        try { await r.body.cancel(); } catch (e) {}
+        mfUrlCache.delete(quickKey);
+      }
+    } catch (err) {
+      if (err && err.name === 'AbortError') return res.end();
       mfUrlCache.delete(quickKey);
-      upstream = null;
     }
+  }
 
-    if (!upstream) return res.status(502).send('MediaFire did not return the file (blocked or expired). Try again.');
+  if (!upstream) {
+    if (res.headersSent) return res.destroy();
+    return res.redirect(302, lastUrl || 'https://www.mediafire.com/file/' + quickKey + '/file');
+  }
 
+  try {
     res.status(upstream.status);
     const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
     for (const h of pass) {
@@ -534,7 +596,6 @@ app.get('/mf/:key/:name?', async (req, res) => {
     body.pipe(res);
   } catch (err) {
     if (res.headersSent) return res.destroy();
-    if (err && err.name === 'AbortError') return res.end();
     res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
   }
 });
