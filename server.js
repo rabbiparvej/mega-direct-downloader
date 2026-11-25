@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 const CACHE_TTL = 30 * 60 * 1000;
 const VIDEO_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|ts|3gp|mpg|mpeg|ogv)$/i;
 const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder|file)\/([A-Za-z0-9_-]+))?/i;
+const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
 
 const cache = new Map();
 const pending = new Map();
@@ -49,6 +50,27 @@ async function getFolder(folderId, key) {
   }
 }
 
+async function getSingleFile(fileId, key) {
+  const ck = 'file:' + fileId + '#' + key;
+  const hit = cache.get(ck);
+  if (hit && Date.now() - hit.at < CACHE_TTL) return hit.root;
+  if (pending.has(ck)) return pending.get(ck);
+
+  const job = (async () => {
+    const file = File.fromURL('https://mega.nz/file/' + fileId + '#' + key);
+    await file.loadAttributes();
+    cache.set(ck, { root: file, at: Date.now() });
+    return file;
+  })();
+
+  pending.set(ck, job);
+  try {
+    return await job;
+  } finally {
+    pending.delete(ck);
+  }
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of cache) if (now - v.at > CACHE_TTL) cache.delete(k);
@@ -70,7 +92,7 @@ function formatSize(bytes) {
   return n.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
 }
 
-async function listLink(link, origin) {
+async function listFolderLink(link, origin) {
   const m = String(link).trim().match(MEGA_RE);
   if (!m) throw new Error('Invalid MEGA folder link');
   const [, folderId, key, subType, subId] = m;
@@ -129,6 +151,93 @@ async function listLink(link, origin) {
   };
 }
 
+async function listSingleLink(link, origin) {
+  const m = String(link).trim().match(MEGA_FILE_RE);
+  if (!m) throw new Error('Invalid MEGA link');
+  const fileId = m[1] || m[2];
+  const key = m[3];
+
+  const file = await getSingleFile(fileId, key);
+  if (file.directory) throw new Error('This link is not a file');
+
+  const name = file.name || 'file';
+  const dl = origin + '/dlf/' + fileId + '/' + encodeURIComponent(name) + '?k=' + key;
+
+  return {
+    ok: true,
+    title: name,
+    count: 1,
+    totalSize: formatSize(file.size),
+    items: [
+      {
+        index: 1,
+        name,
+        path: '',
+        size: file.size,
+        sizeText: formatSize(file.size),
+        download: dl,
+        stream: dl + '&inline=1'
+      }
+    ]
+  };
+}
+
+async function listLink(link, origin) {
+  const text = String(link).trim();
+  if (MEGA_RE.test(text)) return listFolderLink(text, origin);
+  if (MEGA_FILE_RE.test(text)) return listSingleLink(text, origin);
+  throw new Error('Invalid MEGA link');
+}
+
+function sendNode(req, res, node) {
+  const size = node.size;
+  const name = node.name;
+  const inline = req.query.inline === '1';
+  const disposition = (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name);
+
+  let start = 0;
+  let end = size - 1;
+  let status = 200;
+
+  const range = req.headers.range;
+  if (range) {
+    const rm = /bytes=(\d*)-(\d*)/.exec(range);
+    if (rm) {
+      if (rm[1] !== '') {
+        start = parseInt(rm[1], 10);
+        if (rm[2] !== '') end = Math.min(parseInt(rm[2], 10), size - 1);
+      } else if (rm[2] !== '') {
+        start = Math.max(size - parseInt(rm[2], 10), 0);
+      }
+      if (start > end || start >= size) {
+        res.status(416).set('Content-Range', 'bytes */' + size);
+        return res.end();
+      }
+      status = 206;
+    }
+  }
+
+  const mime = /\.mp4$|\.m4v$/i.test(name) ? 'video/mp4'
+    : /\.webm$/i.test(name) ? 'video/webm'
+    : /\.mkv$/i.test(name) ? 'video/x-matroska'
+    : 'application/octet-stream';
+
+  res.status(status);
+  res.set({
+    'Content-Type': mime,
+    'Content-Length': end - start + 1,
+    'Accept-Ranges': 'bytes',
+    'Content-Disposition': disposition,
+    'Cache-Control': 'no-store'
+  });
+  if (status === 206) res.set('Content-Range', 'bytes ' + start + '-' + end + '/' + size);
+
+  const stream = node.download({ start, end: end + 1 });
+  stream.on('error', () => res.destroy());
+  res.on('close', () => stream.destroy());
+  stream.pipe(res);
+}
+
 app.post('/api/list', async (req, res) => {
   const links = Array.isArray(req.body.links) ? req.body.links : [];
   if (!links.length) return res.status(400).json({ ok: false, error: 'No links provided' });
@@ -139,7 +248,7 @@ app.post('/api/list', async (req, res) => {
     try {
       results.push({ link, ...(await listLink(link, origin)) });
     } catch (err) {
-      results.push({ link, ok: false, error: err.message || 'Failed to load folder' });
+      results.push({ link, ok: false, error: err.message || 'Failed to load link' });
     }
   }
   res.json({ results });
@@ -171,53 +280,22 @@ app.get('/dl/:folderId/:pid/:name?', async (req, res) => {
     const hit = indexNodes(root).find((x) => !x.node.directory && x.parts.join('/') === wanted);
     if (!hit) return res.status(404).send('File not found');
 
-    const node = hit.node;
-    const size = node.size;
-    const name = node.name;
-    const inline = req.query.inline === '1';
-    const disposition = (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name);
+    sendNode(req, res, hit.node);
+  } catch (err) {
+    if (!res.headersSent) res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
+    else res.destroy();
+  }
+});
 
-    let start = 0;
-    let end = size - 1;
-    let status = 200;
+app.get('/dlf/:fileId/:name?', async (req, res) => {
+  const { fileId } = req.params;
+  const key = req.query.k;
+  if (!key) return res.status(400).send('Missing key');
 
-    const range = req.headers.range;
-    if (range) {
-      const rm = /bytes=(\d*)-(\d*)/.exec(range);
-      if (rm) {
-        if (rm[1] !== '') {
-          start = parseInt(rm[1], 10);
-          if (rm[2] !== '') end = Math.min(parseInt(rm[2], 10), size - 1);
-        } else if (rm[2] !== '') {
-          start = Math.max(size - parseInt(rm[2], 10), 0);
-        }
-        if (start > end || start >= size) {
-          res.status(416).set('Content-Range', 'bytes */' + size);
-          return res.end();
-        }
-        status = 206;
-      }
-    }
-
-    const mime = /\.mp4$|\.m4v$/i.test(name) ? 'video/mp4'
-      : /\.webm$/i.test(name) ? 'video/webm'
-      : /\.mkv$/i.test(name) ? 'video/x-matroska'
-      : 'application/octet-stream';
-
-    res.status(status);
-    res.set({
-      'Content-Type': mime,
-      'Content-Length': end - start + 1,
-      'Accept-Ranges': 'bytes',
-      'Content-Disposition': disposition,
-      'Cache-Control': 'no-store'
-    });
-    if (status === 206) res.set('Content-Range', 'bytes ' + start + '-' + end + '/' + size);
-
-    const stream = node.download({ start, end: end + 1 });
-    stream.on('error', () => res.destroy());
-    res.on('close', () => stream.destroy());
-    stream.pipe(res);
+  try {
+    const file = await getSingleFile(fileId, key);
+    if (!file || file.directory) return res.status(404).send('File not found');
+    sendNode(req, res, file);
   } catch (err) {
     if (!res.headersSent) res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
     else res.destroy();
@@ -309,13 +387,13 @@ footer{text-align:center;margin-top:50px;color:var(--muted);font-size:13px}
   <header>
     <span class="badge"><i></i> Online</span>
     <h1>MegaDL Premium</h1>
-    <p>MEGA Folder লিংক দিন — সব ভিডিওর Direct Download লিংক পেয়ে যান</p>
+    <p>MEGA Folder বা Single File লিংক দিন — Direct Download লিংক পেয়ে যান</p>
   </header>
 
   <section class="card input-card">
-    <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA Folder লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY"></textarea>
+    <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://mega.nz/file/XXXXXXXX#YYYYYYYYYYYY"></textarea>
     <div class="row">
-      <span class="hint">একাধিক Folder লিংক দেওয়া যাবে (সর্বোচ্চ ২০টি)</span>
+      <span class="hint">Folder ও Single File দুটোই দেওয়া যাবে, একসাথে একাধিক (সর্বোচ্চ ২০টি)</span>
       <button class="btn btn-primary" id="go">Generate Links</button>
     </div>
   </section>
