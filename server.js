@@ -3,15 +3,6 @@ const zlib = require('zlib');
 const { Readable } = require('stream');
 const { File } = require('megajs');
 
-let tgLib = null;
-let tgSessions = null;
-let tgBigInt = null;
-try {
-  tgLib = require('telegram');
-  tgSessions = require('telegram/sessions');
-  tgBigInt = require('big-integer');
-} catch (e) {}
-
 const app = express();
 app.set('trust proxy', true);
 app.use(express.json({ limit: '1mb' }));
@@ -19,12 +10,7 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = 30 * 60 * 1000;
 const MF_URL_TTL = 8 * 60 * 1000;
-const TG_MSG_TTL = 10 * 60 * 1000;
 const PD_API_KEY = process.env.PIXELDRAIN_API_KEY || '';
-const TG_API_ID = parseInt(process.env.TELEGRAM_API_ID || '0', 10);
-const TG_API_HASH = process.env.TELEGRAM_API_HASH || '';
-const TG_SESSION = process.env.TELEGRAM_SESSION || '';
-
 const VIDEO_EXT = /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|ts|3gp|mpg|mpeg|ogv)$/i;
 const MEGA_RE = /mega\.nz\/folder\/([A-Za-z0-9_-]+)#([A-Za-z0-9_-]+)(?:\/(folder|file)\/([A-Za-z0-9_-]+))?/i;
 const MEGA_FILE_RE = /mega\.nz\/(?:file\/([A-Za-z0-9_-]+)#|#!([A-Za-z0-9_-]+)!)([A-Za-z0-9_-]+)/i;
@@ -32,8 +18,6 @@ const MF_FOLDER_RE = /mediafire\.com\/folder\/([A-Za-z0-9]+)/i;
 const MF_FILE_RE = /mediafire\.com\/(?:file|file_premium|view|download)\/([A-Za-z0-9]+)|mediafire\.com\/\?([A-Za-z0-9]+)/i;
 const PD_LIST_RE = /(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)\/l\/([A-Za-z0-9_-]+)/i;
 const PD_FILE_RE = /(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)\/(?:u|api\/file)\/([A-Za-z0-9_-]+)/i;
-const TG_RE = /(?:https?:\/\/)?(?:t\.me|telegram\.me|telegram\.dog)\/(?:(c)\/(\d+)|(?:s\/)?([A-Za-z0-9_]{3,}))\/(?:(\d+)\/)?(\d+)/i;
-
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const BROWSER_HEADERS = {
   'User-Agent': UA,
@@ -53,11 +37,6 @@ const pending = new Map();
 const mfUrlCache = new Map();
 const pdZipCache = new Map();
 const pdZipPending = new Map();
-const tgMsgCache = new Map();
-const tgWebCache = new Map();
-
-let tgClient = null;
-let tgClientPromise = null;
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -121,8 +100,6 @@ setInterval(() => {
   for (const [k, v] of cache) if (now - v.at > CACHE_TTL) cache.delete(k);
   for (const [k, v] of mfUrlCache) if (now - v.at > MF_URL_TTL) mfUrlCache.delete(k);
   for (const [k, v] of pdZipCache) if (now - v.at > CACHE_TTL) pdZipCache.delete(k);
-  for (const [k, v] of tgMsgCache) if (now - v.at > TG_MSG_TTL) tgMsgCache.delete(k);
-  for (const [k, v] of tgWebCache) if (now - v.at > MF_URL_TTL) tgWebCache.delete(k);
 }, 5 * 60 * 1000).unref();
 
 function baseUrl(req) {
@@ -671,274 +648,6 @@ async function listPdList(link, origin) {
   };
 }
 
-// ---------------- Telegram Helpers (MTProto + Web Fallback) ----------------
-
-function tgHasMtproto() {
-  return !!(tgLib && tgSessions && TG_API_ID && TG_API_HASH && TG_SESSION);
-}
-
-function toTgInt(n) {
-  return tgBigInt ? tgBigInt(n) : n;
-}
-
-async function getTgClient() {
-  if (!tgHasMtproto()) throw new Error('Telegram MTProto not configured');
-  if (tgClient && tgClient.connected) return tgClient;
-  if (tgClientPromise) return tgClientPromise;
-
-  tgClientPromise = (async () => {
-    const { TelegramClient } = tgLib;
-    const { StringSession } = tgSessions;
-    const client = new TelegramClient(
-      new StringSession(TG_SESSION),
-      TG_API_ID,
-      TG_API_HASH,
-      { connectionRetries: 5 }
-    );
-    if (client.setLogLevel) client.setLogLevel('error');
-    await client.connect();
-    tgClient = client;
-    return client;
-  })();
-
-  try {
-    return await tgClientPromise;
-  } finally {
-    tgClientPromise = null;
-  }
-}
-
-function parseTgLink(link) {
-  const m = String(link).trim().match(TG_RE);
-  if (!m) throw new Error('Invalid Telegram post link');
-  const isPrivate = m[1] === 'c';
-  const peerKey = isPrivate ? ('c_' + m[2]) : m[3];
-  const msgId = parseInt(m[5], 10);
-  if (!msgId) throw new Error('Invalid Telegram message ID');
-  return { isPrivate, peerKey, channelId: isPrivate ? m[2] : null, username: isPrivate ? null : m[3], msgId };
-}
-
-function tgPeerInput(peerKey) {
-  const { Api } = tgLib;
-  if (peerKey.startsWith('c_')) {
-    return new Api.PeerChannel({ channelId: toTgInt(peerKey.slice(2)) });
-  }
-  return peerKey;
-}
-
-function extFromMime(mime) {
-  if (!mime) return '.bin';
-  if (/mp4/i.test(mime)) return '.mp4';
-  if (/matroska|mkv/i.test(mime)) return '.mkv';
-  if (/webm/i.test(mime)) return '.webm';
-  if (/quicktime/i.test(mime)) return '.mov';
-  if (/x-msvideo|avi/i.test(mime)) return '.avi';
-  if (/zip/i.test(mime)) return '.zip';
-  if (/pdf/i.test(mime)) return '.pdf';
-  if (/android\.package-archive/i.test(mime)) return '.apk';
-  if (/rar/i.test(mime)) return '.rar';
-  if (/7z/i.test(mime)) return '.7z';
-  return '.bin';
-}
-
-function extractDocFromMessage(msg) {
-  if (!msg || !msg.media || !msg.media.document) return null;
-  const doc = msg.media.document;
-  const mime = doc.mimeType || 'application/octet-stream';
-  let name = '';
-  for (const attr of doc.attributes || []) {
-    if (attr.fileName) {
-      name = attr.fileName;
-      break;
-    }
-  }
-  if (!name) {
-    name = 'telegram_' + msg.id + extFromMime(mime);
-  }
-  const size = Number(doc.size || 0);
-  return { msgId: msg.id, doc, name, mime, size };
-}
-
-async function getTgMessageDoc(peerKey, msgId, fresh) {
-  const ck = peerKey + '/' + msgId;
-  const hit = tgMsgCache.get(ck);
-  if (!fresh && hit && Date.now() - hit.at < TG_MSG_TTL) return hit.data;
-
-  const client = await getTgClient();
-  const entity = tgPeerInput(peerKey);
-  const msgs = await client.getMessages(entity, { ids: [msgId] });
-  const msg = msgs && msgs[0];
-  if (!msg) throw new Error('Telegram message not found or inaccessible');
-
-  const data = extractDocFromMessage(msg);
-  if (!data) throw new Error('No downloadable file found in this Telegram post');
-
-  tgMsgCache.set(ck, { data, at: Date.now() });
-  return data;
-}
-
-async function listTgMtproto(parsed, origin) {
-  const client = await getTgClient();
-  const entity = tgPeerInput(parsed.peerKey);
-  const msgs = await client.getMessages(entity, { ids: [parsed.msgId] });
-  const first = msgs && msgs[0];
-  if (!first) throw new Error('Telegram message not found or inaccessible');
-
-  let targetMsgs = [first];
-  if (first.groupedId) {
-    const startId = Math.max(1, parsed.msgId - 9);
-    const ids = [];
-    for (let i = startId; i <= parsed.msgId + 9; i++) ids.push(i);
-    const nearby = await client.getMessages(entity, { ids });
-    const gid = String(first.groupedId);
-    const groupMsgs = (nearby || []).filter((m) => m && m.groupedId && String(m.groupedId) === gid);
-    if (groupMsgs.length) {
-      groupMsgs.sort((a, b) => a.id - b.id);
-      targetMsgs = groupMsgs;
-    }
-  }
-
-  const docs = [];
-  for (const m of targetMsgs) {
-    const info = extractDocFromMessage(m);
-    if (info) {
-      tgMsgCache.set(parsed.peerKey + '/' + m.id, { data: info, at: Date.now() });
-      docs.push(info);
-    }
-  }
-
-  if (!docs.length) {
-    throw new Error('No downloadable video or file found in this Telegram post');
-  }
-
-  let title = parsed.username ? ('@' + parsed.username) : 'Telegram Channel';
-  try {
-    const chat = await client.getEntity(entity);
-    if (chat && chat.title) title = chat.title;
-  } catch (e) {}
-
-  const items = docs.map((d, i) => {
-    const dl = origin + '/tg/' + encodeURIComponent(parsed.peerKey) + '/' + d.msgId + '/' + encodeURIComponent(d.name);
-    return {
-      index: i + 1,
-      name: d.name,
-      path: '',
-      size: d.size,
-      sizeText: formatSize(d.size),
-      download: dl,
-      stream: dl + '?inline=1'
-    };
-  });
-
-  return {
-    ok: true,
-    title: docs.length === 1 ? docs[0].name : title,
-    count: items.length,
-    totalSize: formatSize(items.reduce((s, x) => s + (x.size || 0), 0)),
-    items
-  };
-}
-
-function decodeHtmlEntities(s) {
-  return String(s || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>');
-}
-
-async function resolveTgWeb(username, msgId, fresh) {
-  const ck = username + '/' + msgId;
-  const hit = tgWebCache.get(ck);
-  if (!fresh && hit && Date.now() - hit.at < MF_URL_TTL) return hit;
-
-  const pageUrl = 'https://t.me/' + encodeURIComponent(username) + '/' + msgId + '?embed=1&mode=tme';
-  const r = await fetch(pageUrl, {
-    headers: { ...BROWSER_HEADERS, Referer: 'https://t.me/' },
-    signal: AbortSignal.timeout(15000)
-  });
-  if (!r.ok) throw new Error('Telegram preview failed (' + r.status + ')');
-  const html = await r.text();
-
-  let title = '@' + username;
-  const tm = html.match(/<span dir="auto">([^<]+)<\/span>/i);
-  if (tm) title = decodeHtmlEntities(tm[1]).trim() || title;
-
-  let videoUrl = null;
-  const patterns = [
-    /<video[^>]+src="([^"]+)"/i,
-    /<source[^>]+src="([^"]+)"/i,
-    /data-src="(https?:\/\/[^"]+)"/i
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m && /^https?:\/\//i.test(m[1]) && !/\.(?:jpg|jpeg|png|webp)(?:\?|$)/i.test(m[1])) {
-      videoUrl = decodeHtmlEntities(m[1]);
-      break;
-    }
-  }
-
-  if (!videoUrl) {
-    if (/message_media_not_supported|MEDIA_TOO_BIG|View in Telegram|tgme_widget_message_document/i.test(html)) {
-      throw new Error('ফাইলটি বড় বা Document হওয়ায় Telegram Web Preview-তে নেই। এটি ডাউনলোড করতে সার্ভারে TELEGRAM_API_ID, TELEGRAM_API_HASH ও TELEGRAM_SESSION সেট করুন।');
-    }
-    throw new Error('Telegram পোস্টে কোনো সরাসরি ভিডিও পাওয়া যায়নি (অথবা চ্যানেলটি প্রাইভেট)');
-  }
-
-  let size = 0;
-  try {
-    const hr = await fetch(videoUrl, {
-      method: 'HEAD',
-      headers: { 'User-Agent': UA, Referer: 'https://t.me/' },
-      signal: AbortSignal.timeout(10000)
-    });
-    const cl = parseInt(hr.headers.get('content-length') || '0', 10);
-    if (cl > 0) size = cl;
-    try { if (hr.body) await hr.body.cancel(); } catch (e) {}
-  } catch (e) {}
-
-  const name = username + '_' + msgId + '.mp4';
-  const info = { url: videoUrl, name, title, size, at: Date.now() };
-  tgWebCache.set(ck, info);
-  return info;
-}
-
-async function listTgWeb(parsed, origin) {
-  if (parsed.isPrivate) {
-    throw new Error('প্রাইভেট চ্যানেল (t.me/c/...) ডাউনলোড করতে TELEGRAM_API_ID, TELEGRAM_API_HASH ও TELEGRAM_SESSION সেট করুন');
-  }
-  const info = await resolveTgWeb(parsed.username, parsed.msgId, false);
-  const dl = origin + '/tgw/' + encodeURIComponent(parsed.username) + '/' + parsed.msgId + '/' + encodeURIComponent(info.name);
-  return {
-    ok: true,
-    title: info.title || info.name,
-    count: 1,
-    totalSize: formatSize(info.size),
-    items: [
-      {
-        index: 1,
-        name: info.name,
-        path: '',
-        size: info.size,
-        sizeText: formatSize(info.size),
-        download: dl,
-        stream: dl + '?inline=1'
-      }
-    ]
-  };
-}
-
-async function listTgLink(link, origin) {
-  const parsed = parseTgLink(link);
-  if (tgHasMtproto()) {
-    return listTgMtproto(parsed, origin);
-  }
-  return listTgWeb(parsed, origin);
-}
-
-// ---------------- Router Dispatch ----------------
-
 async function listLink(link, origin) {
   const text = String(link).trim();
   if (MEGA_RE.test(text)) return listFolderLink(text, origin);
@@ -947,8 +656,7 @@ async function listLink(link, origin) {
   if (MF_FILE_RE.test(text)) return listMfFile(text, origin);
   if (PD_LIST_RE.test(text)) return listPdList(text, origin);
   if (PD_FILE_RE.test(text)) return listPdFile(text, origin);
-  if (TG_RE.test(text)) return listTgLink(text, origin);
-  throw new Error('Invalid link (MEGA, MediaFire, PixelDrain or Telegram only)');
+  throw new Error('Invalid link (MEGA, MediaFire or PixelDrain only)');
 }
 
 async function mfFromApi(quickKey) {
@@ -1328,7 +1036,7 @@ app.get('/pdz/:id/:idx/:name?', async (req, res) => {
         'Content-Length': 0,
         'Accept-Ranges': 'bytes',
         'Content-Disposition': disposition,
-        ETag: etag,
+        'ETag': etag,
         'Last-Modified': lastMod,
         'Cache-Control': 'private, no-cache'
       });
@@ -1353,7 +1061,7 @@ app.get('/pdz/:id/:idx/:name?', async (req, res) => {
       'Content-Length': rInfo.end - rInfo.start + 1,
       'Accept-Ranges': 'bytes',
       'Content-Disposition': disposition,
-      ETag: etag,
+      'ETag': etag,
       'Last-Modified': lastMod,
       'Cache-Control': 'private, no-cache'
     });
@@ -1463,220 +1171,7 @@ app.get('/pdz/:id/:idx/:name?', async (req, res) => {
   }
 });
 
-// ---------------- Telegram Routes ----------------
-
-app.get('/tg/:peer/:msgId/:name?', async (req, res) => {
-  if (!tgHasMtproto()) return res.status(503).send('Telegram MTProto not configured');
-  const peerKey = req.params.peer;
-  const msgId = parseInt(req.params.msgId, 10);
-  const inline = req.query.inline === '1';
-  if (!msgId) return res.status(400).send('Bad message id');
-
-  let closed = false;
-  res.on('close', () => { closed = true; });
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const client = await getTgClient();
-      const { Api } = tgLib;
-      const info = await getTgMessageDoc(peerKey, msgId, attempt > 0);
-      const name = req.params.name || info.name;
-      const size = info.size;
-      const mime = VIDEO_EXT.test(name) ? videoMime(name) : (info.mime || 'application/octet-stream');
-      const disposition = (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name);
-
-      if (size === 0) {
-        res.status(200).set({
-          'Content-Type': mime,
-          'Content-Length': 0,
-          'Accept-Ranges': 'bytes',
-          'Content-Disposition': disposition,
-          'Cache-Control': 'no-store'
-        });
-        return res.end();
-      }
-
-      const rInfo = parseRangeHeader(req.headers.range, size);
-      if (rInfo.invalid) {
-        res.status(416).set('Content-Range', 'bytes */' + size);
-        return res.end();
-      }
-
-      const etag = '"tg-' + peerKey + '-' + msgId + '-' + size + '"';
-
-      if (req.method === 'HEAD') {
-        res.status(rInfo.status).set({
-          'Content-Type': mime,
-          'Content-Length': rInfo.end - rInfo.start + 1,
-          'Accept-Ranges': 'bytes',
-          'Content-Disposition': disposition,
-          ETag: etag,
-          'Cache-Control': 'private, no-cache'
-        });
-        if (rInfo.status === 206) {
-          res.set('Content-Range', 'bytes ' + rInfo.start + '-' + rInfo.end + '/' + size);
-        }
-        return res.end();
-      }
-
-      const chunkAlign = 512 * 1024;
-      const alignedStart = Math.floor(rInfo.start / chunkAlign) * chunkAlign;
-      const needed = rInfo.end - rInfo.start + 1;
-      const loc = new Api.InputDocumentFileLocation({
-        id: info.doc.id,
-        accessHash: info.doc.accessHash,
-        fileReference: info.doc.fileReference,
-        thumbSize: ''
-      });
-
-      const iter = client.iterDownload({
-        file: loc,
-        dcId: info.doc.dcId,
-        fileSize: toTgInt(size),
-        offset: toTgInt(alignedStart),
-        requestSize: chunkAlign
-      });
-
-      let pos = alignedStart;
-      let sent = 0;
-      let headersWritten = false;
-
-      for await (const chunk of iter) {
-        if (closed || res.writableEnded || res.destroyed) break;
-
-        if (!headersWritten) {
-          headersWritten = true;
-          res.status(rInfo.status).set({
-            'Content-Type': mime,
-            'Content-Length': needed,
-            'Accept-Ranges': 'bytes',
-            'Content-Disposition': disposition,
-            ETag: etag,
-            'Cache-Control': 'private, no-cache'
-          });
-          if (rInfo.status === 206) {
-            res.set('Content-Range', 'bytes ' + rInfo.start + '-' + rInfo.end + '/' + size);
-          }
-        }
-
-        const chunkStart = pos;
-        const chunkEnd = pos + chunk.length;
-        pos = chunkEnd;
-
-        if (chunkEnd <= rInfo.start) continue;
-
-        const sliceFrom = Math.max(0, rInfo.start - chunkStart);
-        const remaining = needed - sent;
-        const sliceTo = Math.min(chunk.length, sliceFrom + remaining);
-        if (sliceTo > sliceFrom) {
-          const out = (sliceFrom === 0 && sliceTo === chunk.length)
-            ? chunk
-            : chunk.subarray(sliceFrom, sliceTo);
-          sent += out.length;
-          if (!res.write(out)) {
-            await new Promise((resolve) => {
-              const done = () => {
-                res.removeListener('drain', done);
-                res.removeListener('close', done);
-                resolve();
-              };
-              res.once('drain', done);
-              res.once('close', done);
-            });
-          }
-        }
-        if (sent >= needed || closed) break;
-      }
-
-      if (!res.headersSent && !closed) {
-        res.status(502).send('Telegram returned empty stream');
-      } else if (!res.writableEnded && !closed) {
-        res.end();
-      }
-      return;
-    } catch (err) {
-      const msg = (err && (err.errorMessage || err.message)) || '';
-      if (attempt === 0 && !res.headersSent && /FILE_REFERENCE_EXPIRED/i.test(msg)) {
-        tgMsgCache.delete(peerKey + '/' + msgId);
-        continue;
-      }
-      if (res.headersSent) return res.destroy();
-      return res.status(500).send('Telegram download failed: ' + (msg || 'unknown error'));
-    }
-  }
-});
-
-app.get('/tgw/:username/:msgId/:name?', async (req, res) => {
-  const username = req.params.username;
-  const msgId = parseInt(req.params.msgId, 10);
-  const name = req.params.name || (username + '_' + msgId + '.mp4');
-  const inline = req.query.inline === '1';
-
-  const ac = new AbortController();
-  res.on('close', () => {
-    if (!res.writableEnded) ac.abort();
-  });
-
-  let upstream = null;
-  for (let attempt = 0; attempt < 2 && !upstream; attempt++) {
-    try {
-      const info = await resolveTgWeb(username, msgId, attempt > 0);
-      const headers = { 'User-Agent': UA, Referer: 'https://t.me/' };
-      if (req.headers.range) headers.Range = req.headers.range;
-
-      const r = await fetch(info.url, {
-        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        headers,
-        redirect: 'follow',
-        signal: ac.signal
-      });
-      if (r.status === 200 || r.status === 206) {
-        upstream = r;
-      } else {
-        try { if (r.body) await r.body.cancel(); } catch (e) {}
-        tgWebCache.delete(username + '/' + msgId);
-      }
-    } catch (err) {
-      if (err && err.name === 'AbortError') return res.end();
-      tgWebCache.delete(username + '/' + msgId);
-    }
-  }
-
-  if (!upstream) {
-    if (res.headersSent) return res.destroy();
-    return res.status(502).send('Telegram media stream unavailable');
-  }
-
-  try {
-    res.status(upstream.status);
-    const pass = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
-    for (const h of pass) {
-      const v = upstream.headers.get(h);
-      if (v) res.set(h, v);
-    }
-    if (!upstream.headers.get('accept-ranges')) res.set('Accept-Ranges', 'bytes');
-    res.set('Content-Type', videoMime(name));
-    res.set(
-      'Content-Disposition',
-      (inline ? 'inline' : 'attachment') + "; filename*=UTF-8''" + encodeURIComponent(name)
-    );
-    res.set('Cache-Control', 'no-store');
-
-    if (req.method === 'HEAD') {
-      try { if (upstream.body) await upstream.body.cancel(); } catch (e) {}
-      return res.end();
-    }
-
-    const body = Readable.fromWeb(upstream.body);
-    body.on('error', () => res.destroy());
-    body.pipe(res);
-  } catch (err) {
-    if (res.headersSent) return res.destroy();
-    res.status(500).send('Download failed: ' + (err.message || 'unknown error'));
-  }
-});
-
-app.get('/health', (req, res) => res.json({ ok: true, tgMtproto: tgHasMtproto() }));
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PAGE = String.raw`<!DOCTYPE html>
 <html lang="bn" data-theme="dark">
@@ -1758,7 +1253,7 @@ nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:
   background:linear-gradient(110deg,var(--text) 10%,var(--a2) 50%,var(--a1) 75%,var(--a3));
   background-size:200% auto;-webkit-background-clip:text;background-clip:text;color:transparent;animation:shine 8s linear infinite}
 @keyframes shine{to{background-position:200% center}}
-.hero p{color:var(--muted);font-size:16px;max-width:650px;margin:0 auto;line-height:1.7}
+.hero p{color:var(--muted);font-size:16px;max-width:620px;margin:0 auto;line-height:1.7}
 .chips{display:flex;justify-content:center;gap:10px;flex-wrap:wrap;margin-top:22px}
 .chip{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;border:1px solid var(--line);background:var(--panel);font-size:12.5px;font-weight:600;color:var(--muted)}
 .chip b{width:8px;height:8px;border-radius:50%}
@@ -1807,7 +1302,6 @@ textarea::placeholder{color:var(--muted);opacity:.75}
 .src.mega{background:rgba(251,113,133,.14);color:var(--err);border:1px solid rgba(251,113,133,.35)}
 .src.mf{background:rgba(34,211,238,.12);color:var(--a2);border:1px solid rgba(34,211,238,.35)}
 .src.pd{background:rgba(139,92,246,.16);color:#c4b5fd;border:1px solid rgba(139,92,246,.4)}
-.src.tg{background:rgba(56,189,248,.16);color:#38bdf8;border:1px solid rgba(56,189,248,.4)}
 .f-tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .search,.select{padding:10px 14px;border-radius:11px;border:1px solid var(--line);background:var(--input);color:var(--text);font:500 13px 'Inter','Hind Siliguri',sans-serif;outline:none;transition:.2s}
 .search{min-width:180px}
@@ -1894,19 +1388,18 @@ footer b{background:var(--grad);-webkit-background-clip:text;background-clip:tex
 
   <header class="hero">
     <h1>MegaDL Premium</h1>
-    <p>MEGA, MediaFire, PixelDrain ও Telegram-এর Folder, ZIP বা File লিংক দিন, মুহূর্তেই Direct Download ও Stream লিংক পেয়ে যান।</p>
+    <p>MEGA, MediaFire ও PixelDrain এর Folder, ZIP বা Single File লিংক দিন, মুহূর্তেই Direct Download ও Stream লিংক পেয়ে যান।</p>
     <div class="chips">
       <span class="chip"><b style="background:var(--err)"></b>MEGA Folder &amp; File</span>
       <span class="chip"><b style="background:var(--a2)"></b>MediaFire Folder &amp; File</span>
       <span class="chip"><b style="background:var(--a1)"></b>PixelDrain Video &amp; ZIP</span>
-      <span class="chip"><b style="background:#38bdf8"></b>Telegram File &amp; Video</span>
       <span class="chip"><b style="background:var(--ok)"></b>Resume &amp; Stream Support</span>
     </div>
   </header>
 
   <section class="card input-card">
     <div class="ta-wrap">
-      <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA, MediaFire, PixelDrain বা Telegram লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://www.mediafire.com/folder/XXXXXXXX/name&#10;https://pixeldrain.com/u/XXXXXXXX&#10;https://t.me/channelname/123"></textarea>
+      <textarea id="links" spellcheck="false" placeholder="প্রতি লাইনে একটি করে MEGA, MediaFire বা PixelDrain লিংক দিন&#10;https://mega.nz/folder/XXXXXXXX#YYYYYYYYYYYY&#10;https://www.mediafire.com/folder/XXXXXXXX/name&#10;https://pixeldrain.com/u/XXXXXXXX&#10;https://pixeldrain.com/l/XXXXXXXX"></textarea>
       <div class="ta-tools">
         <span class="counter" id="counter">0 লিংক</span>
         <span style="display:flex;gap:8px">
@@ -2029,7 +1522,6 @@ function extOf(name) {
 function srcOf(link) {
   if (/mediafire\.com/i.test(link)) return 'mf';
   if (/(?:pixeldrain\.(?:com|net|dev|nl|biz|tech)|pixeldra\.in)/i.test(link)) return 'pd';
-  if (/(?:t\.me|telegram\.me|telegram\.dog)/i.test(link)) return 'tg';
   return 'mega';
 }
 
@@ -2155,7 +1647,7 @@ function render(results) {
     st.className = 'stats';
     st.innerHTML =
       '<div class="card stat"><small>Sources</small><strong>' + okCount + '</strong></div>' +
-      '<div class="card stat"><small>Files</small><strong>' + fileCount + '</strong></div>' +
+      '<div class="card stat"><small>Videos</small><strong>' + fileCount + '</strong></div>' +
       '<div class="card stat"><small>Total Size</small><strong>' + esc(fmt(totalBytes())) + '</strong></div>';
     box.appendChild(st);
 
@@ -2183,13 +1675,13 @@ function render(results) {
     }
 
     var s = srcOf(r.link);
-    var srcLabel = s === 'mf' ? 'MEDIAFIRE' : (s === 'pd' ? 'PIXELDRAIN' : (s === 'tg' ? 'TELEGRAM' : 'MEGA'));
+    var srcLabel = s === 'mf' ? 'MEDIAFIRE' : (s === 'pd' ? 'PIXELDRAIN' : 'MEGA');
     var isFolder = r.items.length !== 1 || /folder|\/l\//i.test(r.link) || /\.zip$/i.test(r.title || '');
     el.innerHTML =
       '<div class="f-head"><div class="f-id"><div class="f-ico">' + (isFolder ? ICON_FOLDER : ICON_FILE) + '</div>' +
       '<div style="min-width:0"><div class="f-title">' + esc(r.title) + '</div>' +
       '<div class="f-meta"><span class="src ' + s + '">' + srcLabel + '</span>' +
-      '<span>' + r.count + ' ফাইল · ' + esc(r.totalSize) + '</span></div></div></div>' +
+      '<span>' + r.count + ' ভিডিও · ' + esc(r.totalSize) + '</span></div></div></div>' +
       '<div class="f-tools">' +
       '<input class="search" placeholder="Search..." data-search="' + ri + '">' +
       '<select class="select" data-sort="' + ri + '">' +
